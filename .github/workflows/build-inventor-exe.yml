@@ -32,6 +32,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -139,6 +141,84 @@ jobs:
           }
           $tag = "v$series.$env:GITHUB_RUN_NUMBER"
           $title = "Custom MCPs $tag"
+          $previousTag = git tag --merged $env:GITHUB_SHA --sort=-creatordate |
+            Select-Object -First 1
+          $range = if ($previousTag) {
+            "$previousTag..$env:GITHUB_SHA"
+          } else {
+            $env:GITHUB_SHA
+          }
+
+          $groups = [ordered]@{
+            "✨ New features" = [System.Collections.Generic.List[string]]::new()
+            "🐛 Fixes" = [System.Collections.Generic.List[string]]::new()
+            "📚 Documentation" = [System.Collections.Generic.List[string]]::new()
+            "🧰 Maintenance" = [System.Collections.Generic.List[string]]::new()
+          }
+          $commitLines = git log $range --format="%H`t%h`t%s"
+          foreach ($line in $commitLines) {
+            $parts = $line -split "`t", 3
+            if ($parts.Count -ne 3) {
+              continue
+            }
+            $fullSha, $shortSha, $subject = $parts
+            $cleanSubject = $subject -replace '^(feat|fix|docs|chore|ci|build|test|refactor)(\([^)]+\))?!?:\s*', ''
+            $entry = "- $cleanSubject ([$shortSha](https://github.com/$env:GITHUB_REPOSITORY/commit/$fullSha))"
+            if ($subject -match '^feat(\([^)]+\))?!?:') {
+              $groups["✨ New features"].Add($entry)
+            } elseif ($subject -match '^fix(\([^)]+\))?!?:') {
+              $groups["🐛 Fixes"].Add($entry)
+            } elseif ($subject -match '^docs(\([^)]+\))?!?:') {
+              $groups["📚 Documentation"].Add($entry)
+            } else {
+              $groups["🧰 Maintenance"].Add($entry)
+            }
+          }
+
+          $changelogSections = [System.Collections.Generic.List[string]]::new()
+          foreach ($group in $groups.GetEnumerator()) {
+            if ($group.Value.Count -eq 0) {
+              continue
+            }
+            $changelogSections.Add("### $($group.Key)")
+            foreach ($entry in $group.Value) {
+              $changelogSections.Add($entry)
+            }
+            $changelogSections.Add("")
+          }
+          $changelog = $changelogSections -join "`n"
+          $comparison = if ($previousTag) {
+            "https://github.com/$env:GITHUB_REPOSITORY/compare/$previousTag...$tag"
+          } else {
+            "https://github.com/$env:GITHUB_REPOSITORY/commits/$tag"
+          }
+          $notes = @"
+          ## 📦 Downloads
+
+          | File | Purpose |
+          | --- | --- |
+          | **custom-mcp-manager.exe** | Recommended installer and client configuration UI |
+          | **inventor-mcp-server.exe** | Autodesk Inventor MCP server |
+          | **moodle-mcp-server.exe** | Moodle MCP server |
+          | **SHA256SUMS.txt** | SHA-256 checksums for all executables |
+
+          ## 🔐 Verify your download
+
+          ``````powershell
+          Get-FileHash .\custom-mcp-manager.exe -Algorithm SHA256
+          Get-Content .\SHA256SUMS.txt
+          ``````
+
+          ## 📝 Changelog
+
+          $changelog
+          **[Full changelog]($comparison)**
+
+          > [!IMPORTANT]
+          > These binaries are experimental. Test them before using important
+          > Moodle data or production CAD documents.
+          "@
+          $notes | Set-Content -LiteralPath "release-notes.md" -Encoding utf8NoBOM
 
           gh release create $tag `
             "dist/inventor-mcp-server.exe" `
@@ -147,4 +227,4 @@ jobs:
             "dist/SHA256SUMS.txt" `
             --target $env:GITHUB_SHA `
             --title $title `
-            --generate-notes
+            --notes-file "release-notes.md"
