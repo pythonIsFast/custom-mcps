@@ -1,0 +1,4 @@
+pyinstaller --onefile --name inventor-mcp-server ^
+  --hidden-import win32timezone ^
+  --hidden-import win32com.gen_py ^
+  inventor_mcp_server.py
