@@ -17,3 +17,6 @@ dist/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Local agent instructions (must not be published)
+AGENTS.md
