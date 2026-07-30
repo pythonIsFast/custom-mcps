@@ -25,11 +25,14 @@ application built with an HTML interface and a Python bridge.
 - Downloads the latest executables directly from GitHub Releases
 - Streams downloads with live progress
 - Verifies GitHub-provided SHA-256 asset digests
-- Installs files atomically in `%LOCALAPPDATA%\CustomMCPs\bin`
+- Compares installed files with the newest available release at startup
+- Installs, updates, and uninstalls executables atomically
+- Supports a custom installation directory
 - Detects Codex, Claude Desktop, Cursor, and Visual Studio Code
-- Configures selected clients and servers with one click
+- Adds or removes individual MCP entries in selected clients
 - Preserves unrelated client settings
-- Creates timestamped backups before changing existing configurations
+- Creates and restores timestamped configuration backups
+- Creates Desktop and Start Menu shortcuts
 - Opens Moodle's secure terminal login setup
 - Keeps an in-app activity log for troubleshooting
 
@@ -234,10 +237,19 @@ Release:
 - `inventor-mcp-server.exe`
 - `moodle-mcp-server.exe`
 - `custom-mcp-manager.exe`
+- `SHA256SUMS.txt`
 
-Download them from the repository's **Releases** page. Each release uses a
-unique `build-<run number>-<commit>` tag. The same files are also available as a
-workflow artifact for 30 days.
+Download them from the repository's **Releases** page. Releases use semantic
+`v<major>.<minor>.<build>` tags and include automatically generated, categorized
+release notes. The same files are also available as a workflow artifact for 30
+days.
+
+Verify a downloaded executable against the published checksum file:
+
+```powershell
+Get-FileHash .\custom-mcp-manager.exe -Algorithm SHA256
+Get-Content .\SHA256SUMS.txt
+```
 
 The workflow can be started manually from **Actions → Build and release MCP
 executables → Run workflow**.
@@ -265,7 +277,7 @@ executables → Run workflow**.
 - Harden Moodle URL validation and credential storage
 - Add a Moodle compatibility test matrix
 - Split shared configuration into installable Python packages
-- Add CI checks, releases, and prebuilt artifacts
+- Add code signing for stronger Windows SmartScreen trust
 
 ## 🤝 Contributing
 

@@ -12,6 +12,8 @@ on:
       - installer_manager.py
       - installer_ui/**
       - tests/**
+      - VERSION
+      - .github/release.yml
       - .github/workflows/build-inventor-exe.yml
 
 permissions:
@@ -83,6 +85,8 @@ jobs:
             --windowed `
             --name custom-mcp-manager `
             --add-data "installer_ui;installer_ui" `
+            --hidden-import win32com.client `
+            --hidden-import win32timezone `
             --collect-all webview `
             installer_manager.py
 
@@ -100,6 +104,18 @@ jobs:
             Get-FileHash -LiteralPath $artifact.FullName -Algorithm SHA256
           }
 
+      - name: Create SHA-256 checksums
+        shell: pwsh
+        run: |
+          $checksums = Get-ChildItem -LiteralPath dist -Filter "*.exe" |
+            Sort-Object Name |
+            ForEach-Object {
+              $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              "$hash  $($_.Name)"
+            }
+          $checksums | Set-Content -LiteralPath "dist/SHA256SUMS.txt" -Encoding utf8NoBOM
+          Get-Content -LiteralPath "dist/SHA256SUMS.txt"
+
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -108,6 +124,7 @@ jobs:
             dist/inventor-mcp-server.exe
             dist/moodle-mcp-server.exe
             dist/custom-mcp-manager.exe
+            dist/SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 30
 
@@ -116,25 +133,18 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $shortSha = $env:GITHUB_SHA.Substring(0, 7)
-          $tag = "build-$env:GITHUB_RUN_NUMBER-$shortSha"
-          $title = "Custom MCP Servers build $env:GITHUB_RUN_NUMBER"
-          $notes = @"
-          Automated Windows x64 build from commit $env:GITHUB_SHA.
-
-          Included executables:
-          - inventor-mcp-server.exe
-          - moodle-mcp-server.exe
-          - custom-mcp-manager.exe
-
-          These binaries are experimental. Test them before using important
-          Moodle data or production CAD documents.
-          "@
+          $series = (Get-Content -LiteralPath "VERSION" -Raw).Trim()
+          if ($series -notmatch '^\d+\.\d+$') {
+            throw "VERSION must contain a major.minor release series, for example 0.2"
+          }
+          $tag = "v$series.$env:GITHUB_RUN_NUMBER"
+          $title = "Custom MCPs $tag"
 
           gh release create $tag `
             "dist/inventor-mcp-server.exe" `
             "dist/moodle-mcp-server.exe" `
             "dist/custom-mcp-manager.exe" `
+            "dist/SHA256SUMS.txt" `
             --target $env:GITHUB_SHA `
             --title $title `
-            --notes $notes
+            --generate-notes

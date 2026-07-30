@@ -521,6 +521,11 @@
       background: rgba(81, 215, 164, .09);
     }
 
+    .badge.update {
+      color: var(--amber);
+      background: rgba(246, 191, 103, .1);
+    }
+
     .server-description {
       min-height: 38px;
       margin: 16px 0 15px;
@@ -690,6 +695,74 @@
       background: rgba(74, 119, 225, .16);
     }
 
+    .danger {
+      color: #ffc1c8;
+      border-color: rgba(255, 111, 127, .3);
+    }
+
+    .settings-stack {
+      display: grid;
+      gap: 15px;
+    }
+
+    .settings-panel {
+      padding: 20px;
+    }
+
+    .path-control {
+      display: flex;
+      width: min(650px, 100%);
+      gap: 8px;
+    }
+
+    .text-input {
+      min-width: 0;
+      flex: 1;
+      padding: 0 12px;
+      border: 1px solid var(--border-strong);
+      border-radius: 9px;
+      outline: none;
+      color: var(--text);
+      font-size: 11px;
+      background: rgba(4, 7, 13, .42);
+    }
+
+    .text-input:focus {
+      border-color: rgba(91, 167, 255, .65);
+    }
+
+    .backup-list {
+      display: grid;
+      gap: 9px;
+      margin-top: 17px;
+    }
+
+    .backup-item {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 16px;
+      padding: 13px 14px;
+      border: 1px solid var(--border);
+      border-radius: 11px;
+      background: rgba(5, 9, 17, .24);
+    }
+
+    .backup-name {
+      margin-bottom: 4px;
+      font-size: 11px;
+      font-weight: 700;
+    }
+
+    .backup-meta {
+      overflow: hidden;
+      color: var(--muted);
+      font-family: Consolas, monospace;
+      font-size: 8px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
     .log-panel {
       overflow: hidden;
       border: 1px solid var(--border);
@@ -807,6 +880,9 @@
         <button class="nav-button" data-page="activity">
           <span class="nav-icon">≡</span> Activity
         </button>
+        <button class="nav-button" data-page="settings">
+          <span class="nav-icon">⚙</span> Settings
+        </button>
       </nav>
 
       <div class="sidebar-foot">
@@ -922,12 +998,25 @@
           </div>
           <div class="config-row">
             <div>
+              <div class="config-title">Remove MCP entries</div>
+              <div class="config-description">Only the selected Custom MCP entries are removed. Other client settings stay untouched.</div>
+            </div>
+            <button id="removeButton" class="button danger" onclick="removeClientEntries()">Remove selected entries</button>
+          </div>
+          <div class="config-row">
+            <div>
               <div class="config-title">Moodle login setup</div>
               <div class="config-description">Opens the secure terminal setup for the installed Moodle server.</div>
             </div>
             <button class="button" onclick="runMoodleSetup()">Open setup</button>
           </div>
         </div>
+
+        <div class="section-title">
+          <h2>Configuration backups</h2>
+          <span class="config-description">Restore a previous client configuration with one click.</span>
+        </div>
+        <div id="backupList" class="panel settings-panel"></div>
       </section>
 
       <section id="page-activity" class="page">
@@ -946,6 +1035,47 @@
           </div>
           <div id="logs" class="logs">
             <div class="empty">No activity yet.<br>Install a server or configure a client to begin.</div>
+          </div>
+        </div>
+      </section>
+
+      <section id="page-settings" class="page">
+        <header class="page-header">
+          <div>
+            <div class="eyebrow">Application preferences</div>
+            <h1>Settings</h1>
+            <p class="subtitle">Choose where executables are stored and add convenient Windows shortcuts.</p>
+          </div>
+        </header>
+        <div class="settings-stack">
+          <div class="panel settings-panel">
+            <div class="config-title">Installation directory</div>
+            <p class="config-description">Installed executables are kept in a <strong>bin</strong> folder below this path. Existing files are safely moved and verified.</p>
+            <div class="path-control">
+              <input id="installDirectory" class="text-input" type="text" spellcheck="false">
+              <button class="button" onclick="browseInstallDirectory()">Browse</button>
+              <button class="button primary" onclick="saveInstallDirectory()">Apply</button>
+            </div>
+          </div>
+          <div class="panel settings-panel">
+            <div class="config-row">
+              <div>
+                <div class="config-title">Desktop shortcut</div>
+                <div class="config-description">Create a shortcut to Custom MCP Manager on your desktop.</div>
+              </div>
+              <button class="button" onclick="createShortcuts(['desktop'])">Create</button>
+            </div>
+            <div class="config-row">
+              <div>
+                <div class="config-title">Start Menu shortcut</div>
+                <div class="config-description">Add Custom MCP Manager under “Custom MCPs” in the Windows Start Menu.</div>
+              </div>
+              <button class="button" onclick="createShortcuts(['start_menu'])">Create</button>
+            </div>
+          </div>
+          <div class="panel settings-panel">
+            <div class="config-title">Automatic update check</div>
+            <p class="config-description" style="margin:0">Enabled. The manager checks GitHub Releases on every start and marks servers whose SHA-256 differs from the latest available build.</p>
           </div>
         </div>
       </section>
@@ -1023,10 +1153,18 @@
       const p = app.progress[server.id] || { percent: 0, status: "Ready" };
       const icon = server.id === "inventor" ? "I" : "M";
       const installed = Boolean(server.installed);
-      const label = installed ? "Installed" : "Not installed";
-      const action = installed ? "Update" : "Install";
+      const label = server.update_available
+        ? "Update available"
+        : server.up_to_date
+          ? "Current"
+          : installed ? "Installed" : "Not installed";
+      const badgeClass = server.update_available ? "update" : installed ? "installed" : "";
+      const action = installed ? (server.update_available ? "Update now" : "Reinstall") : "Install";
       const secondary = server.id === "moodle" && installed
         ? `<button class="button small" onclick="runMoodleSetup()">Login setup</button>`
+        : "";
+      const uninstall = installed
+        ? `<button class="button danger small" onclick="uninstallServer('${server.id}')" ${app.busy ? "disabled" : ""}>Uninstall</button>`
         : "";
 
       return `
@@ -1039,7 +1177,7 @@
                 <div class="server-path" title="${escapeHtml(server.path)}">${escapeHtml(server.path)}</div>
               </div>
             </div>
-            <span class="badge ${installed ? "installed" : ""}">${label}</span>
+            <span class="badge ${badgeClass}">${label}</span>
           </div>
           <p class="server-description">${escapeHtml(server.description)}</p>
           <div class="progress"><div id="progress-${mode}-${server.id}" class="progress-bar" style="width:${p.percent}%"></div></div>
@@ -1050,6 +1188,7 @@
           <div class="server-actions">
             <button class="button ${installed ? "" : "primary"} small" onclick="installServer('${server.id}')" ${app.busy ? "disabled" : ""}>${action}</button>
             ${secondary}
+            ${uninstall}
           </div>
         </article>`;
     }
@@ -1087,6 +1226,30 @@
       document.getElementById("clientGrid").innerHTML = html;
     }
 
+    function renderBackups() {
+      if (!app.state) return;
+      const container = document.getElementById("backupList");
+      const backups = app.state.backups || [];
+      if (!backups.length) {
+        container.innerHTML = `<div class="config-description">No backups yet. A backup is created automatically before an existing client configuration is changed.</div>`;
+        return;
+      }
+      container.innerHTML = `<div class="backup-list">${backups.map(backup => `
+        <div class="backup-item">
+          <div style="min-width:0">
+            <div class="backup-name">${escapeHtml(backup.client_name)} · ${formatDate(backup.modified_at * 1000)}</div>
+            <div class="backup-meta" title="${escapeHtml(backup.path)}">${escapeHtml(backup.path)} · ${formatBytes(backup.size)}</div>
+          </div>
+          <button class="button small" onclick="restoreBackup('${encodeURIComponent(backup.id)}')">Restore</button>
+        </div>`).join("")}</div>`;
+    }
+
+    function renderSettings() {
+      if (!app.state) return;
+      const input = document.getElementById("installDirectory");
+      if (document.activeElement !== input) input.value = app.state.install_dir || "";
+    }
+
     function renderRelease() {
       const release = app.release;
       const name = document.getElementById("releaseName");
@@ -1122,9 +1285,12 @@
     function render() {
       renderServers();
       renderClients();
+      renderBackups();
       renderRelease();
       renderStats();
+      renderSettings();
       document.getElementById("configureButton").disabled = app.busy;
+      document.getElementById("removeButton").disabled = app.busy;
     }
 
     function toggleClient(id) {
@@ -1221,6 +1387,7 @@
       const result = await window.pywebview.api.refresh_release();
       if (result.ok) {
         app.release = result.release;
+        await loadState();
         toast(`Latest release: ${result.release.tag}`, "success");
       } else {
         toast(result.error, "error");
@@ -1234,6 +1401,17 @@
       const result = await window.pywebview.api.install_server(id);
       if (result.ok) toast(`${id === "inventor" ? "Inventor" : "Moodle"} MCP installed.`, "success");
       else toast(result.error || "Installation failed.", "error");
+      await loadState();
+      setBusy(false);
+    }
+
+    async function uninstallServer(id) {
+      const name = id === "inventor" ? "Inventor" : "Moodle";
+      if (!confirm(`Uninstall ${name} MCP executable? Client configuration entries will remain until you remove them separately.`)) return;
+      setBusy(true);
+      const result = await window.pywebview.api.uninstall_server(id);
+      if (result.ok) toast(`${name} MCP was uninstalled.`, "success");
+      else toast(result.error || "Uninstall failed.", "error");
       await loadState();
       setBusy(false);
     }
@@ -1270,6 +1448,78 @@
         toast(result.error || "Configuration failed.", "error");
       }
       setBusy(false);
+    }
+
+    async function removeClientEntries() {
+      if (!app.selectedClients.size || !app.selectedServers.size) {
+        toast("Select at least one client and one server.", "error");
+        return;
+      }
+      if (!confirm("Remove the selected Custom MCP entries from the selected clients? A backup is created before every change.")) return;
+      setBusy(true);
+      const result = await window.pywebview.api.remove_client_entries(
+        Array.from(app.selectedClients),
+        Array.from(app.selectedServers)
+      );
+      if (result.ok) {
+        toast(result.changed.length ? "Selected MCP entries removed." : "No matching entries were found.", "success");
+        await loadState();
+      } else {
+        toast(result.error || "Could not remove entries.", "error");
+      }
+      setBusy(false);
+    }
+
+    async function restoreBackup(encodedId) {
+      const id = decodeURIComponent(encodedId);
+      const backup = (app.state?.backups || []).find(item => item.id === id);
+      if (!backup) {
+        toast("Backup not found.", "error");
+        return;
+      }
+      if (!confirm(`Restore this ${backup.client_name} backup? The current configuration will receive a safety backup first.`)) return;
+      setBusy(true);
+      const result = await window.pywebview.api.restore_backup(backup.client_id, backup.path);
+      if (result.ok) {
+        toast(`${backup.client_name} configuration restored. Restart the client.`, "success");
+        await loadState();
+      } else {
+        toast(result.error || "Restore failed.", "error");
+      }
+      setBusy(false);
+    }
+
+    async function browseInstallDirectory() {
+      const result = await window.pywebview.api.choose_install_directory();
+      if (result.ok && !result.cancelled) {
+        document.getElementById("installDirectory").value = result.path;
+      } else if (!result.ok) {
+        toast(result.error, "error");
+      }
+    }
+
+    async function saveInstallDirectory() {
+      const path = document.getElementById("installDirectory").value.trim();
+      if (!path) {
+        toast("Choose an installation directory.", "error");
+        return;
+      }
+      if (!confirm("Move installed executables to this directory? Reconfigure clients afterwards so they use the new paths.")) return;
+      setBusy(true);
+      const result = await window.pywebview.api.set_install_directory(path, true);
+      if (result.ok) {
+        toast(`Installation directory updated. Reconfigure clients if executables were moved.`, "success");
+        await loadState();
+      } else {
+        toast(result.error || "Could not change directory.", "error");
+      }
+      setBusy(false);
+    }
+
+    async function createShortcuts(locations) {
+      const result = await window.pywebview.api.create_shortcuts(locations);
+      if (result.ok) toast(`Created ${result.created.length} shortcut(s).`, "success");
+      else toast(result.error || "Could not create shortcut.", "error");
     }
 
     async function openFolder() {

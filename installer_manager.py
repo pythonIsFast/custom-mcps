@@ -80,23 +80,29 @@ class ManagerApi:
         self,
         *,
         install_dir: Path | None = None,
+        settings_root: Path | None = None,
         home_dir: Path | None = None,
         appdata_dir: Path | None = None,
         session: requests.Session | None = None,
     ):
         local_appdata = os.environ.get("LOCALAPPDATA")
         appdata = os.environ.get("APPDATA")
-
+        default_root = (
+            Path(local_appdata) / "CustomMCPs"
+            if local_appdata
+            else Path.home() / ".custom-mcps"
+        )
+        self.settings_root = Path(settings_root or default_root)
+        self.settings_path = self.settings_root / "manager-settings.json"
+        self.metadata_path = self.settings_root / "install-state.json"
+        saved_settings = self._read_json_file(self.settings_path)
+        configured_dir = saved_settings.get("install_dir")
         self.install_dir = Path(
             install_dir
-            or (
-                Path(local_appdata) / "CustomMCPs"
-                if local_appdata
-                else Path.home() / ".custom-mcps"
-            )
+            if install_dir is not None
+            else (configured_dir if isinstance(configured_dir, str) else default_root)
         )
         self.bin_dir = self.install_dir / "bin"
-        self.metadata_path = self.install_dir / "install-state.json"
         self.home_dir = Path(home_dir or Path.home())
         self.appdata_dir = Path(
             appdata_dir
@@ -140,14 +146,41 @@ class ManagerApi:
         for server_id, spec in SERVERS.items():
             path = self.bin_dir / spec["asset"]
             installed = path.exists()
+            local_digest = sha256_file(path) if installed else None
+            release_asset = (self._release or {}).get("assets", {}).get(
+                spec["asset"], {}
+            )
+            available_digest = self._digest_value(release_asset.get("digest"))
+            installed_tag = metadata.get(server_id, {}).get("release_tag")
+            available_tag = (self._release or {}).get("tag")
+            if installed and local_digest and available_digest:
+                up_to_date = local_digest.lower() == available_digest.lower()
+                update_available = not up_to_date
+            else:
+                up_to_date = bool(
+                    installed
+                    and installed_tag
+                    and available_tag
+                    and installed_tag == available_tag
+                )
+                update_available = bool(
+                    installed
+                    and installed_tag
+                    and available_tag
+                    and installed_tag != available_tag
+                )
             servers[server_id] = {
                 **spec,
                 "id": server_id,
                 "installed": installed,
                 "path": str(path),
                 "size": path.stat().st_size if installed else 0,
-                "sha256": sha256_file(path) if installed else None,
-                "release_tag": metadata.get(server_id, {}).get("release_tag"),
+                "sha256": local_digest,
+                "release_tag": installed_tag,
+                "available_release_tag": available_tag,
+                "available_sha256": available_digest,
+                "up_to_date": up_to_date,
+                "update_available": update_available,
             }
 
         return {
@@ -157,6 +190,7 @@ class ManagerApi:
             "install_dir": str(self.install_dir),
             "servers": servers,
             "clients": self._client_states(),
+            "backups": self.list_backups(),
             "release": self._release,
         }
 
@@ -217,6 +251,36 @@ class ManagerApi:
                         "results": results,
                     }
             return {"ok": True, "results": results, "state": self.get_state()}
+        finally:
+            self._operation_lock.release()
+
+    def uninstall_server(self, server_id: str) -> dict[str, Any]:
+        if server_id not in SERVERS:
+            return {"ok": False, "error": f"Unknown server: {server_id}"}
+        if not self._operation_lock.acquire(blocking=False):
+            return {"ok": False, "error": "Another installation is already running."}
+        try:
+            spec = SERVERS[server_id]
+            target = self.bin_dir / spec["asset"]
+            try:
+                target.unlink(missing_ok=True)
+            except PermissionError:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"Could not remove {target.name}. Close MCP clients using "
+                        "the executable and try again."
+                    ),
+                }
+            metadata = self._load_metadata()
+            metadata.pop(server_id, None)
+            self._save_metadata(metadata)
+            self._log(f"Uninstalled {spec['name']}.", "success")
+            return {"ok": True, "state": self.get_state()}
+        except Exception as exc:
+            message = f"Uninstall failed: {exc}"
+            self._log(message, "error")
+            return {"ok": False, "error": message}
         finally:
             self._operation_lock.release()
 
@@ -344,13 +408,23 @@ class ManagerApi:
         return digest.split(":", 1)[-1] if ":" in digest else digest
 
     def _load_metadata(self) -> dict[str, Any]:
-        if not self.metadata_path.exists():
+        return self._read_json_file(self.metadata_path)
+
+    @staticmethod
+    def _read_json_file(path: Path) -> dict[str, Any]:
+        if not path.exists():
             return {}
         try:
-            data = json.loads(self.metadata_path.read_text(encoding="utf-8"))
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
             return data if isinstance(data, dict) else {}
         except (OSError, ValueError):
             return {}
+
+    def _save_metadata(self, metadata: dict[str, Any]) -> None:
+        self._atomic_write_text(
+            self.metadata_path,
+            json.dumps(metadata, indent=2, ensure_ascii=False) + "\n",
+        )
 
     def _save_server_metadata(
         self, server_id: str, target: Path, digest: str
@@ -362,10 +436,7 @@ class ManagerApi:
             "release_tag": (self._release or {}).get("tag"),
             "installed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
-        self._atomic_write_text(
-            self.metadata_path,
-            json.dumps(metadata, indent=2, ensure_ascii=False) + "\n",
-        )
+        self._save_metadata(metadata)
 
     # ---------------------------------------------------------- Client configure
 
@@ -440,6 +511,67 @@ class ManagerApi:
             "backups": backups,
             "clients": self._client_states(),
         }
+
+    def remove_client_entries(
+        self, client_ids: list[str], server_ids: list[str]
+    ) -> dict[str, Any]:
+        validation = self._validate_client_server_selection(client_ids, server_ids)
+        if validation:
+            return validation
+
+        changed = []
+        backups = []
+        try:
+            definitions = self._client_definitions()
+            for client_id in client_ids:
+                definition = definitions[client_id]
+                path = definition["path"]
+                if not path.exists():
+                    continue
+                if definition["format"] == "codex_toml":
+                    backup = self._remove_codex_entries(path, server_ids)
+                else:
+                    backup = self._remove_json_entries(
+                        path, definition["root_key"], server_ids
+                    )
+                if backup:
+                    backups.append(str(backup))
+                    changed.append(client_id)
+                    self._log(
+                        f"Removed selected entries from {definition['name']}.",
+                        "success",
+                    )
+            return {
+                "ok": True,
+                "changed": changed,
+                "backups": backups,
+                "clients": self._client_states(),
+            }
+        except Exception as exc:
+            message = f"Removing client entries failed: {exc}"
+            self._log(message, "error")
+            return {"ok": False, "error": message, "backups": backups}
+
+    def _validate_client_server_selection(
+        self, client_ids: Any, server_ids: Any
+    ) -> dict[str, Any] | None:
+        if not isinstance(client_ids, list) or not client_ids:
+            return {"ok": False, "error": "Select at least one MCP client."}
+        if not isinstance(server_ids, list) or not server_ids:
+            return {"ok": False, "error": "Select at least one MCP server."}
+        unknown_clients = set(client_ids) - set(self._client_definitions())
+        unknown_servers = set(server_ids) - set(SERVERS)
+        if unknown_clients:
+            return {
+                "ok": False,
+                "error": f"Unknown clients: {', '.join(sorted(unknown_clients))}",
+            }
+        if unknown_servers:
+            return {
+                "ok": False,
+                "error": f"Unknown servers: {', '.join(sorted(unknown_servers))}",
+            }
+        return None
 
     def _client_definitions(self) -> dict[str, dict[str, Any]]:
         return {
@@ -612,6 +744,131 @@ class ManagerApi:
         self._atomic_write_text(path, text)
         return backup
 
+    def _remove_json_entries(
+        self, path: Path, root_key: str, server_ids: list[str]
+    ) -> Path | None:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+        except ValueError as exc:
+            raise ValueError(
+                f"{path} contains invalid JSON and was not changed: {exc}"
+            ) from exc
+        if not isinstance(data, dict):
+            raise ValueError(f"{path} must contain a JSON object.")
+        entries = data.get(root_key)
+        if not isinstance(entries, dict):
+            return None
+        changed = False
+        for server_id in server_ids:
+            changed = entries.pop(SERVERS[server_id]["config_name"], None) is not None or changed
+        if not changed:
+            return None
+        backup = self._backup_file(path)
+        self._atomic_write_text(
+            path, json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+        )
+        return backup
+
+    def _remove_codex_entries(
+        self, path: Path, server_ids: list[str]
+    ) -> Path | None:
+        text = path.read_text(encoding="utf-8")
+        try:
+            tomllib.loads(text)
+        except tomllib.TOMLDecodeError as exc:
+            raise ValueError(
+                f"{path} contains invalid TOML and was not changed: {exc}"
+            ) from exc
+        original = text
+        for server_id in server_ids:
+            section = f"mcp_servers.{SERVERS[server_id]['config_name']}"
+            pattern = re.compile(
+                rf"(?ms)^\[{re.escape(section)}\][^\n]*\n.*?(?=^\[|\Z)"
+            )
+            text = pattern.sub("", text)
+        if text == original:
+            return None
+        text = text.rstrip() + "\n" if text.strip() else ""
+        tomllib.loads(text)
+        backup = self._backup_file(path)
+        self._atomic_write_text(path, text)
+        return backup
+
+    def list_backups(self) -> list[dict[str, Any]]:
+        backups = []
+        for client_id, definition in self._client_definitions().items():
+            path = definition["path"]
+            try:
+                candidates = sorted(
+                    path.parent.glob(f"{path.name}.backup-*"),
+                    key=lambda item: item.stat().st_mtime,
+                    reverse=True,
+                )
+            except OSError:
+                candidates = []
+            for candidate in candidates:
+                try:
+                    stat = candidate.stat()
+                except OSError:
+                    continue
+                backups.append(
+                    {
+                        "id": f"{client_id}:{candidate.name}",
+                        "client_id": client_id,
+                        "client_name": definition["name"],
+                        "path": str(candidate),
+                        "name": candidate.name,
+                        "size": stat.st_size,
+                        "modified_at": stat.st_mtime,
+                    }
+                )
+        return sorted(
+            backups, key=lambda item: item["modified_at"], reverse=True
+        )
+
+    def restore_backup(self, client_id: str, backup_path: str) -> dict[str, Any]:
+        definitions = self._client_definitions()
+        if client_id not in definitions:
+            return {"ok": False, "error": f"Unknown client: {client_id}"}
+        definition = definitions[client_id]
+        config_path = definition["path"]
+        candidate = Path(backup_path)
+        try:
+            resolved = candidate.resolve(strict=True)
+            expected_parent = config_path.parent.resolve()
+        except OSError as exc:
+            return {"ok": False, "error": f"Backup is unavailable: {exc}"}
+        if (
+            resolved.parent != expected_parent
+            or not resolved.name.startswith(f"{config_path.name}.backup-")
+        ):
+            return {"ok": False, "error": "The selected backup is not valid."}
+
+        try:
+            content = resolved.read_text(encoding="utf-8-sig")
+            if definition["format"] == "codex_toml":
+                tomllib.loads(content)
+            else:
+                data = json.loads(content)
+                if not isinstance(data, dict):
+                    raise ValueError("The JSON backup must contain an object.")
+            safety_backup = self._backup_file(config_path)
+            self._atomic_write_text(config_path, content)
+            self._log(
+                f"Restored backup for {definition['name']}.", "success"
+            )
+            return {
+                "ok": True,
+                "path": str(config_path),
+                "safety_backup": str(safety_backup) if safety_backup else None,
+                "clients": self._client_states(),
+                "backups": self.list_backups(),
+            }
+        except Exception as exc:
+            message = f"Backup restore failed: {exc}"
+            self._log(message, "error")
+            return {"ok": False, "error": message}
+
     @staticmethod
     def _backup_file(path: Path) -> Path | None:
         if not path.exists():
@@ -630,6 +887,150 @@ class ManagerApi:
         os.replace(temp, path)
 
     # --------------------------------------------------------------- OS actions
+
+    def choose_install_directory(self) -> dict[str, Any]:
+        if self.window is None or webview is None:
+            return {"ok": False, "error": "The folder picker is unavailable."}
+        try:
+            dialog_type = getattr(
+                getattr(webview, "FileDialog", object), "FOLDER", None
+            )
+            if dialog_type is None:
+                dialog_type = getattr(webview, "FOLDER_DIALOG")
+            selected = self.window.create_file_dialog(
+                dialog_type, directory=str(self.install_dir)
+            )
+            if not selected:
+                return {"ok": True, "cancelled": True}
+            path = selected[0] if isinstance(selected, (list, tuple)) else selected
+            return {"ok": True, "path": str(path)}
+        except Exception as exc:
+            return {"ok": False, "error": f"Folder picker failed: {exc}"}
+
+    def set_install_directory(
+        self, new_directory: str, move_existing: bool = True
+    ) -> dict[str, Any]:
+        if not isinstance(new_directory, str) or not new_directory.strip():
+            return {"ok": False, "error": "Choose an installation directory."}
+        new_install_dir = Path(new_directory.strip()).expanduser()
+        if not new_install_dir.is_absolute():
+            return {"ok": False, "error": "The installation path must be absolute."}
+        try:
+            new_install_dir = new_install_dir.resolve()
+            if new_install_dir == self.install_dir.resolve():
+                return {"ok": True, "state": self.get_state()}
+
+            old_bin_dir = self.bin_dir
+            new_bin_dir = new_install_dir / "bin"
+            new_bin_dir.mkdir(parents=True, exist_ok=True)
+            moved = []
+            if move_existing:
+                for spec in SERVERS.values():
+                    source = old_bin_dir / spec["asset"]
+                    if not source.exists():
+                        continue
+                    destination = new_bin_dir / spec["asset"]
+                    if destination.exists() and sha256_file(destination) != sha256_file(source):
+                        return {
+                            "ok": False,
+                            "error": (
+                                f"{destination} already exists with different content. "
+                                "Choose another folder or remove that file first."
+                            ),
+                        }
+                    if not destination.exists():
+                        temp = destination.with_suffix(destination.suffix + ".move")
+                        shutil.copy2(source, temp)
+                        if sha256_file(temp) != sha256_file(source):
+                            temp.unlink(missing_ok=True)
+                            raise ValueError(f"Verification failed while moving {source.name}.")
+                        os.replace(temp, destination)
+                    moved.append((source, destination))
+
+                for source, _ in moved:
+                    source.unlink()
+                try:
+                    old_bin_dir.rmdir()
+                except OSError:
+                    pass
+
+            self.install_dir = new_install_dir
+            self.bin_dir = new_bin_dir
+            self._atomic_write_text(
+                self.settings_path,
+                json.dumps(
+                    {"install_dir": str(self.install_dir)},
+                    indent=2,
+                    ensure_ascii=False,
+                )
+                + "\n",
+            )
+            metadata = self._load_metadata()
+            for server_id, spec in SERVERS.items():
+                target = self.bin_dir / spec["asset"]
+                if target.exists() and server_id in metadata:
+                    metadata[server_id]["path"] = str(target)
+            self._save_metadata(metadata)
+            self._log(
+                f"Installation directory changed to {self.install_dir}.",
+                "success",
+            )
+            return {
+                "ok": True,
+                "moved": len(moved),
+                "state": self.get_state(),
+            }
+        except Exception as exc:
+            message = f"Could not change installation directory: {exc}"
+            self._log(message, "error")
+            return {"ok": False, "error": message}
+
+    def create_shortcuts(self, locations: list[str]) -> dict[str, Any]:
+        allowed = {"desktop", "start_menu"}
+        if not isinstance(locations, list) or not locations:
+            return {"ok": False, "error": "Select at least one shortcut location."}
+        unknown = set(locations) - allowed
+        if unknown:
+            return {
+                "ok": False,
+                "error": f"Unknown shortcut locations: {', '.join(sorted(unknown))}",
+            }
+        if sys.platform != "win32":
+            return {"ok": False, "error": "Shortcuts are supported on Windows only."}
+        try:
+            import win32com.client
+
+            shell = win32com.client.Dispatch("WScript.Shell")
+            if getattr(sys, "frozen", False):
+                target = Path(sys.executable)
+                arguments = ""
+            else:
+                target = Path(sys.executable)
+                arguments = subprocess.list2cmdline([str(Path(__file__).resolve())])
+            created = []
+            for location in locations:
+                if location == "desktop":
+                    folder = Path(shell.SpecialFolders("Desktop"))
+                else:
+                    folder = Path(shell.SpecialFolders("Programs")) / "Custom MCPs"
+                folder.mkdir(parents=True, exist_ok=True)
+                shortcut_path = folder / f"{APP_NAME}.lnk"
+                shortcut = shell.CreateShortcut(str(shortcut_path))
+                shortcut.TargetPath = str(target)
+                shortcut.Arguments = arguments
+                shortcut.WorkingDirectory = str(target.parent)
+                shortcut.Description = (
+                    "Install, update, and configure Custom MCP servers"
+                )
+                shortcut.IconLocation = f"{target},0"
+                shortcut.Save()
+                created.append(str(shortcut_path))
+            self._log(f"Created {len(created)} Windows shortcut(s).", "success")
+            return {"ok": True, "created": created}
+        except Exception as exc:
+            message = f"Could not create shortcuts: {exc}"
+            self._log(message, "error")
+            return {"ok": False, "error": message}
 
     def open_install_folder(self) -> dict[str, Any]:
         try:
