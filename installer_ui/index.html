@@ -164,6 +164,7 @@
       gap: 9px;
       color: var(--muted);
       font-size: 12px;
+      cursor: pointer;
     }
 
     .connection-dot {
@@ -886,7 +887,7 @@
       </nav>
 
       <div class="sidebar-foot">
-        <div id="connection" class="connection">
+        <div id="connection" class="connection" onclick="tryManagerBoot(true)" title="Click to retry the Python bridge">
           <span class="connection-dot"></span>
           <span id="connectionText">Starting Python bridge…</span>
         </div>
@@ -1098,6 +1099,10 @@
       },
       logs: []
     };
+
+    let bridgePollTimer = null;
+    let bridgeTimeoutTimer = null;
+    let bootState = "waiting";
 
     function escapeHtml(value) {
       return String(value ?? "")
@@ -1538,20 +1543,89 @@
       else toast(result.error, "error");
     }
 
-    async function boot() {
+    function bridgeAvailable() {
+      return Boolean(
+        window.pywebview?.api &&
+        typeof window.pywebview.api.bridge_status === "function"
+      );
+    }
+
+    async function tryManagerBoot(manual = false) {
+      if (bootState === "running" || bootState === "ready") return true;
+      if (!bridgeAvailable()) {
+        if (manual) {
+          setConnection(false, "Bridge not ready · retrying…");
+          toast("The Python bridge is not ready yet. Retrying…", "error");
+          beginBridgeWatch(true);
+        }
+        return false;
+      }
+
+      bootState = "running";
+      if (bridgePollTimer) clearInterval(bridgePollTimer);
+      if (bridgeTimeoutTimer) clearTimeout(bridgeTimeoutTimer);
       try {
-        setConnection(true, "Python bridge connected");
+        const health = await window.pywebview.api.bridge_status();
+        if (!health?.ok) throw new Error("Python bridge health check failed.");
+        await boot();
+        bootState = "ready";
+        return true;
+      } catch (error) {
+        bootState = "failed";
+        setConnection(false, "Bridge error · click to retry");
+        addLog(String(error?.stack || error), "error");
+        toast(`Startup failed: ${error}`, "error");
+        return false;
+      }
+    }
+
+    function beginBridgeWatch(restart = false) {
+      if (bootState === "ready" || bootState === "running") return;
+      if (restart) bootState = "waiting";
+      if (bridgePollTimer) clearInterval(bridgePollTimer);
+      if (bridgeTimeoutTimer) clearTimeout(bridgeTimeoutTimer);
+
+      if (bridgeAvailable()) {
+        tryManagerBoot();
+        return;
+      }
+      bridgePollTimer = setInterval(() => {
+        if (bridgeAvailable()) tryManagerBoot();
+      }, 150);
+      bridgeTimeoutTimer = setTimeout(() => {
+        if (bootState !== "waiting") return;
+        clearInterval(bridgePollTimer);
+        setConnection(false, "Bridge unavailable · click to retry");
+        addLog(
+          "Python bridge did not become ready within 20 seconds. See %LOCALAPPDATA%\\CustomMCPs\\manager.log.",
+          "error"
+        );
+        toast("Python bridge unavailable. Click the status in the sidebar to retry.", "error");
+      }, 20000);
+    }
+
+    window.managerBridgeSignal = function() {
+      tryManagerBoot();
+      return true;
+    };
+
+    async function boot() {
+      setConnection(true, "Python bridge connected");
+      try {
         addLog("Custom MCP Manager started.", "success");
         await loadState();
         await refreshRelease();
       } catch (error) {
-        setConnection(false, "Bridge error");
-        addLog(String(error), "error");
-        toast(`Startup failed: ${error}`, "error");
+        throw error;
       }
     }
 
-    window.addEventListener("pywebviewready", boot);
+    window.addEventListener("pywebviewready", () => tryManagerBoot());
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", () => beginBridgeWatch());
+    } else {
+      beginBridgeWatch();
+    }
   </script>
 </body>
 </html>

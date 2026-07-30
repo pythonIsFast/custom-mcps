@@ -119,11 +119,68 @@ class ManagerApi:
         self.window = None
         self._release: dict[str, Any] | None = None
         self._operation_lock = threading.Lock()
+        self._diagnostic_lock = threading.Lock()
+        self._write_diagnostic("Manager API initialized.")
 
     # --------------------------------------------------------------- UI bridge
 
     def attach_window(self, window) -> None:
         self.window = window
+        self._write_diagnostic("Desktop window attached.")
+
+    def bridge_status(self) -> dict[str, Any]:
+        """Small health check used while the HTML/Python bridge starts."""
+        return {
+            "ok": True,
+            "app_name": APP_NAME,
+            "install_dir": str(self.install_dir),
+            "timestamp": time.time(),
+        }
+
+    def _write_diagnostic(self, message: str) -> None:
+        try:
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            log_path = self.settings_root / "manager.log"
+            with self._diagnostic_lock:
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                with log_path.open("a", encoding="utf-8") as handle:
+                    handle.write(f"[{stamp}] {message}\n")
+        except OSError:
+            pass
+
+    def _on_window_loaded(self, *args: Any) -> None:
+        """Signal the page after DOM load as a fallback for pywebviewready."""
+        target = args[0] if args else self.window
+        if target is None:
+            return
+
+        def signal_page() -> None:
+            last_error = None
+            for _ in range(40):
+                try:
+                    acknowledged = target.evaluate_js(
+                        "window.managerBridgeSignal"
+                        " ? window.managerBridgeSignal('python-loaded')"
+                        " : false"
+                    )
+                    if acknowledged:
+                        self._write_diagnostic(
+                            "HTML acknowledged the Python bridge signal."
+                        )
+                        return
+                except Exception as exc:
+                    last_error = exc
+                time.sleep(0.25)
+            detail = f": {last_error}" if last_error else ""
+            self._write_diagnostic(
+                f"HTML did not acknowledge the bridge signal{detail}"
+            )
+
+        threading.Thread(
+            target=signal_page,
+            name="manager-bridge-signal",
+            daemon=True,
+        ).start()
 
     def _emit(self, event: str, **data: Any) -> None:
         if self.window is None:
@@ -1087,6 +1144,7 @@ def main() -> None:
         background_color="#090d18",
     )
     api.attach_window(window)
+    window.events.loaded += api._on_window_loaded
     webview.start(debug="--debug" in sys.argv)
 
 

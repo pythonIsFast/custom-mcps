@@ -67,6 +67,19 @@ class InstallerManagerConfigTests(unittest.TestCase):
         self.assertEqual(server["type"], "stdio")
         self.assertEqual(server["args"], [])
 
+    def test_bridge_health_check_and_diagnostic_log(self):
+        status = self.api.bridge_status()
+
+        self.assertTrue(status["ok"])
+        self.assertEqual(status["app_name"], "Custom MCP Manager")
+        self.assertEqual(status["install_dir"], str(self.install))
+        log_path = self.settings / "manager.log"
+        self.assertTrue(log_path.exists())
+        self.assertIn(
+            "Manager API initialized.",
+            log_path.read_text(encoding="utf-8"),
+        )
+
     def test_codex_merge_preserves_unrelated_toml(self):
         path = self.home / ".codex" / "config.toml"
         path.parent.mkdir(parents=True)
