@@ -113,7 +113,8 @@ The Moodle server signs in through Moodle's regular login page and keeps an auth
 ### Features
 
 - Log in through a local GUI or terminal setup
-- List courses and inspect sections and activities
+- List and search courses with pagination for accounts with many enrolments
+- Inspect course sections and activities
 - Create courses
 - Rename, move, show, hide, duplicate, and delete course content
 - Create and update pages, URLs, labels, folders, forums, assignments, resources, and basic quizzes

@@ -407,45 +407,148 @@ class MoodleSession:
 
     # -- Kurse --
 
-    def list_courses(self):
+    def list_courses(self, search="", limit=25, offset=0):
         try:
+            limit = int(limit)
+            offset = int(offset)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("limit und offset muessen ganze Zahlen sein.") from exc
+        if not 1 <= limit <= 100:
+            raise ValueError("limit muss zwischen 1 und 100 liegen.")
+        if offset < 0:
+            raise ValueError("offset darf nicht negativ sein.")
+        search = str(search or "").strip()
+
+        try:
+            args = {
+                "offset": offset,
+                "limit": limit,
+                "classification": "all",
+                "sort": "fullname",
+            }
+            if search:
+                args["searchvalue"] = search
             data = self.ajax(
                 "core_course_get_enrolled_courses_by_timeline_classification",
-                {"offset": 0, "limit": 0, "classification": "all", "sort": "fullname"},
+                args,
             )
             if isinstance(data, dict):
-                out = [{"id": c.get("id"), "fullname": c.get("fullname"),
+                raw_courses = data.get("courses", [])
+                out = [
+                    {
+                        "id": c.get("id"),
+                        "fullname": c.get("fullname"),
                         "shortname": c.get("shortname"),
                         "kategorie": c.get("coursecategory"),
-                        "sichtbar": c.get("visible")}
-                       for c in data.get("courses", [])]
-                if out:
-                    return {"kurse": out, "quelle": "AJAX (Timeline)"}
+                        "sichtbar": c.get("visible"),
+                    }
+                    for c in raw_courses
+                    if isinstance(c, dict)
+                ]
+                next_offset = data.get("nextoffset")
+                if isinstance(next_offset, int):
+                    next_offset = next_offset if next_offset > offset else None
+                else:
+                    next_offset = (
+                        offset + len(out) if len(out) >= limit else None
+                    )
+                result = {
+                    "kurse": out,
+                    "anzahl": len(out),
+                    "offset": offset,
+                    "limit": limit,
+                    "naechster_offset": next_offset,
+                    "weitere_vorhanden": next_offset is not None,
+                    "suche": search or None,
+                    "quelle": "AJAX (Timeline, paginiert)",
+                }
+                if next_offset is not None:
+                    result["hinweis"] = (
+                        "Weitere Kurse sind vorhanden. moodle_list_courses "
+                        f"mit offset={next_offset} aufrufen."
+                    )
+                return result
         except Exception as e:
             log(f"Kursliste via AJAX fehlgeschlagen: {e}")
 
-        return {"kurse": self._courses_html(),
-                "quelle": "HTML-Fallback (/course/index.php)",
-                "hinweis": "Als Admin sind nicht eingeschriebene Kurse nur "
-                           "hier sichtbar."}
+        courses = self._courses_html(search=search)
+        page = courses[offset:offset + limit]
+        next_offset = offset + len(page) if offset + len(page) < len(courses) else None
+        return {
+            "kurse": page,
+            "anzahl": len(page),
+            "offset": offset,
+            "limit": limit,
+            "naechster_offset": next_offset,
+            "weitere_vorhanden": next_offset is not None,
+            "suche": search or None,
+            "quelle": "HTML-Fallback (Meine Kurse/Dashboard)",
+            "hinweis": (
+                "Der AJAX-Endpunkt war nicht verfuegbar. Der HTML-Fallback "
+                "kann bei dynamisch geladenen Moodle-Dashboards unvollstaendig "
+                "sein."
+            ),
+        }
 
-    def _courses_html(self):
+    def _courses_html(self, search=""):
         found, seen = [], set()
-        for path in ("/course/index.php", "/course/management.php"):
+        search_folded = search.casefold()
+        pages = (
+            (
+                "/my/courses.php",
+                (
+                    '[data-region="course-content"]',
+                    '[data-region="courses-view"]',
+                    ".block_myoverview",
+                    "main",
+                ),
+            ),
+            ("/my/", (".block_myoverview", '[data-region="course-content"]')),
+            ("/course/index.php", ("main",)),
+            ("/course/management.php", ("main",)),
+        )
+        for path, scope_selectors in pages:
             try:
                 r = self.s.get(self.base + path, timeout=30)
+                r.raise_for_status()
             except Exception:
                 continue
             soup = BeautifulSoup(r.text, "html.parser")
-            for a in soup.select('a[href*="/course/view.php?id="]'):
-                m = re.search(r"id=(\d+)", a.get("href", ""))
-                name = a.get_text(strip=True)
-                if m and name and m.group(1) not in seen and m.group(1) != "1":
+            scopes = []
+            for selector in scope_selectors:
+                scopes.extend(soup.select(selector))
+            if not scopes and path == "/my/courses.php":
+                scopes = [soup]
+
+            before = len(found)
+            for scope in scopes:
+                for a in scope.select('a[href*="/course/view.php?id="]'):
+                    m = re.search(r"[?&]id=(\d+)", a.get("href", ""))
+                    name = " ".join(a.get_text(" ", strip=True).split())
+                    if (
+                        not m
+                        or not name
+                        or m.group(1) in seen
+                        or m.group(1) == "1"
+                        or (search_folded and search_folded not in name.casefold())
+                    ):
+                        continue
                     seen.add(m.group(1))
-                    found.append({"id": int(m.group(1)), "fullname": name,
-                                  "shortname": "", "kategorie": ""})
+                    found.append(
+                        {
+                            "id": int(m.group(1)),
+                            "fullname": name,
+                            "shortname": "",
+                            "kategorie": "",
+                        }
+                    )
             if found:
-                break
+                # Dashboard pages contain enrolled courses. Do not mix them
+                # with the site-wide public course catalogue.
+                if path.startswith("/my/") and len(found) > before:
+                    break
+                if path.startswith("/course/"):
+                    break
         return found
 
     # -- Struktur --
@@ -1159,10 +1262,18 @@ def moodle_logout() -> dict:
 
 
 @mcp.tool()
-def moodle_list_courses() -> dict:
+def moodle_list_courses(search: str = "", limit: int = 25,
+                        offset: int = 0) -> dict:
     """Listet die Kurse der Moodle-Instanz mit ID, Name, Kurzname und
-    Kategorie. Die ID brauchst du fuer alle kursbezogenen Werkzeuge."""
-    return with_retry(lambda s: s.list_courses())
+    Kategorie. Die ID brauchst du fuer alle kursbezogenen Werkzeuge.
+
+    Die Ausgabe ist paginiert, damit auch Konten mit vielen Kursen stabil
+    funktionieren. Standardmaessig werden 25 Kurse geliefert. Falls
+    'weitere_vorhanden' wahr ist, rufe das Werkzeug erneut mit dem Wert aus
+    'naechster_offset' auf. Mit search kann serverseitig nach Kursnamen
+    gesucht werden; limit darf zwischen 1 und 100 liegen.
+    """
+    return with_retry(lambda s: s.list_courses(search, limit, offset))
 
 
 @mcp.tool()
