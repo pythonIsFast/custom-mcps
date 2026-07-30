@@ -1,0 +1,1307 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Custom MCP Manager</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #080b13;
+      --panel: rgba(19, 25, 42, 0.82);
+      --panel-solid: #12182a;
+      --panel-hover: #182038;
+      --border: rgba(148, 163, 184, 0.14);
+      --border-strong: rgba(148, 163, 184, 0.28);
+      --text: #f4f7ff;
+      --muted: #8f9ab3;
+      --blue: #5ba7ff;
+      --violet: #9d7bff;
+      --green: #51d7a4;
+      --amber: #f6bf67;
+      --red: #ff6f7f;
+      --shadow: 0 20px 70px rgba(0, 0, 0, 0.32);
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      font-family: Inter, "Segoe UI Variable", "Segoe UI", sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(circle at 15% 10%, rgba(63, 117, 255, 0.16), transparent 34%),
+        radial-gradient(circle at 85% 80%, rgba(140, 82, 255, 0.12), transparent 30%),
+        var(--bg);
+    }
+
+    button, input { font: inherit; }
+    button { color: inherit; }
+
+    .app {
+      display: grid;
+      grid-template-columns: 248px 1fr;
+      width: 100%;
+      height: 100%;
+    }
+
+    .sidebar {
+      display: flex;
+      flex-direction: column;
+      padding: 25px 18px 20px;
+      border-right: 1px solid var(--border);
+      background: rgba(8, 12, 22, 0.76);
+      backdrop-filter: blur(18px);
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 0 9px 25px;
+    }
+
+    .brand-mark {
+      position: relative;
+      display: grid;
+      place-items: center;
+      width: 42px;
+      height: 42px;
+      border: 1px solid rgba(150, 183, 255, 0.35);
+      border-radius: 13px;
+      overflow: hidden;
+      font-weight: 800;
+      letter-spacing: -1px;
+      background: linear-gradient(145deg, #477dff, #9c63f1);
+      box-shadow: 0 10px 28px rgba(71, 125, 255, 0.3);
+    }
+
+    .brand-mark::after {
+      position: absolute;
+      inset: 1px;
+      border-radius: 11px;
+      border: 1px solid rgba(255,255,255,.18);
+      content: "";
+    }
+
+    .brand-copy strong {
+      display: block;
+      font-size: 15px;
+      letter-spacing: .1px;
+    }
+
+    .brand-copy span {
+      display: block;
+      margin-top: 3px;
+      color: var(--muted);
+      font-size: 11px;
+      letter-spacing: .3px;
+    }
+
+    .nav-label {
+      margin: 7px 11px 9px;
+      color: #647089;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 1.3px;
+      text-transform: uppercase;
+    }
+
+    .nav {
+      display: grid;
+      gap: 5px;
+    }
+
+    .nav-button {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      width: 100%;
+      padding: 11px 12px;
+      border: 1px solid transparent;
+      border-radius: 11px;
+      color: #939db5;
+      text-align: left;
+      background: transparent;
+      cursor: pointer;
+      transition: 160ms ease;
+    }
+
+    .nav-button:hover {
+      color: #dce5fb;
+      background: rgba(255, 255, 255, 0.035);
+    }
+
+    .nav-button.active {
+      color: #fff;
+      border-color: rgba(94, 148, 255, .17);
+      background: linear-gradient(90deg, rgba(71, 125, 255, .18), rgba(108, 75, 180, .08));
+    }
+
+    .nav-icon {
+      display: grid;
+      place-items: center;
+      width: 24px;
+      height: 24px;
+      border-radius: 7px;
+      font-size: 12px;
+      font-weight: 700;
+      background: rgba(255, 255, 255, .055);
+    }
+
+    .sidebar-foot {
+      margin-top: auto;
+      padding: 15px 11px 3px;
+      border-top: 1px solid var(--border);
+    }
+
+    .connection {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .connection-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--amber);
+      box-shadow: 0 0 0 4px rgba(246, 191, 103, .1);
+    }
+
+    .connection.online .connection-dot {
+      background: var(--green);
+      box-shadow: 0 0 0 4px rgba(81, 215, 164, .1);
+    }
+
+    .main {
+      min-width: 0;
+      overflow: hidden;
+    }
+
+    .page {
+      display: none;
+      height: 100%;
+      padding: 31px 38px 36px;
+      overflow-y: auto;
+      scrollbar-width: thin;
+      scrollbar-color: #2e3952 transparent;
+    }
+
+    .page.active { display: block; }
+
+    .page-header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 24px;
+      margin-bottom: 27px;
+    }
+
+    .eyebrow {
+      margin-bottom: 7px;
+      color: var(--blue);
+      font-size: 11px;
+      font-weight: 750;
+      letter-spacing: 1.2px;
+      text-transform: uppercase;
+    }
+
+    h1, h2, h3, p { margin-top: 0; }
+    h1 {
+      margin-bottom: 8px;
+      font-size: 28px;
+      line-height: 1.1;
+      letter-spacing: -.7px;
+    }
+
+    .subtitle {
+      max-width: 630px;
+      margin-bottom: 0;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.6;
+    }
+
+    .actions { display: flex; gap: 9px; }
+
+    .button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      min-height: 39px;
+      padding: 0 15px;
+      border: 1px solid var(--border-strong);
+      border-radius: 10px;
+      color: #e5ecfc;
+      font-size: 12px;
+      font-weight: 650;
+      background: rgba(255, 255, 255, .045);
+      cursor: pointer;
+      transition: 150ms ease;
+    }
+
+    .button:hover {
+      transform: translateY(-1px);
+      border-color: rgba(130, 169, 255, .46);
+      background: rgba(255, 255, 255, .075);
+    }
+
+    .button:disabled {
+      opacity: .5;
+      transform: none;
+      cursor: not-allowed;
+    }
+
+    .button.primary {
+      border-color: rgba(113, 153, 255, .55);
+      color: #fff;
+      background: linear-gradient(135deg, #4b7ff6, #7659e8);
+      box-shadow: 0 9px 25px rgba(68, 105, 229, .25);
+    }
+
+    .button.small {
+      min-height: 34px;
+      padding: 0 12px;
+      font-size: 11px;
+    }
+
+    .hero-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.55fr) minmax(260px, .75fr);
+      gap: 16px;
+      margin-bottom: 17px;
+    }
+
+    .hero {
+      position: relative;
+      min-height: 214px;
+      padding: 27px 29px;
+      overflow: hidden;
+      border: 1px solid rgba(104, 143, 241, .2);
+      border-radius: 19px;
+      background:
+        linear-gradient(130deg, rgba(42, 62, 111, .72), rgba(24, 26, 51, .78)),
+        var(--panel-solid);
+      box-shadow: var(--shadow);
+    }
+
+    .hero::before,
+    .hero::after {
+      position: absolute;
+      border-radius: 50%;
+      content: "";
+      filter: blur(2px);
+    }
+
+    .hero::before {
+      width: 230px;
+      height: 230px;
+      top: -115px;
+      right: -45px;
+      background: radial-gradient(circle, rgba(81, 139, 255, .42), transparent 68%);
+    }
+
+    .hero::after {
+      width: 150px;
+      height: 150px;
+      right: 110px;
+      bottom: -105px;
+      background: radial-gradient(circle, rgba(153, 97, 255, .34), transparent 68%);
+    }
+
+    .hero-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 10px;
+      margin-bottom: 24px;
+      border: 1px solid rgba(255,255,255,.1);
+      border-radius: 999px;
+      color: #c8d5f1;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: .45px;
+      text-transform: uppercase;
+      background: rgba(255,255,255,.055);
+    }
+
+    .hero h2 {
+      max-width: 500px;
+      margin-bottom: 10px;
+      font-size: 23px;
+      line-height: 1.25;
+      letter-spacing: -.45px;
+    }
+
+    .hero p {
+      max-width: 520px;
+      margin-bottom: 21px;
+      color: #aebbd5;
+      font-size: 12px;
+      line-height: 1.6;
+    }
+
+    .release-panel, .panel {
+      border: 1px solid var(--border);
+      border-radius: 17px;
+      background: var(--panel);
+      box-shadow: 0 15px 45px rgba(0, 0, 0, .18);
+    }
+
+    .release-panel {
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      padding: 23px;
+    }
+
+    .panel-label {
+      color: #77839c;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+    }
+
+    .release-name {
+      margin: 14px 0 6px;
+      font-size: 20px;
+      font-weight: 730;
+      letter-spacing: -.25px;
+    }
+
+    .release-meta {
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.6;
+    }
+
+    .status-line {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 16px;
+      color: #c9d4eb;
+      font-size: 11px;
+    }
+
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 8px;
+      border-radius: 999px;
+      color: var(--green);
+      font-size: 10px;
+      font-weight: 700;
+      background: rgba(81, 215, 164, .09);
+    }
+
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 13px;
+      margin-bottom: 17px;
+    }
+
+    .stat {
+      padding: 17px 18px;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      background: rgba(18, 24, 42, .72);
+    }
+
+    .stat-value {
+      margin-bottom: 4px;
+      font-size: 21px;
+      font-weight: 730;
+    }
+
+    .stat-label {
+      color: var(--muted);
+      font-size: 10px;
+      letter-spacing: .3px;
+    }
+
+    .section-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin: 27px 0 13px;
+    }
+
+    .section-title h2 {
+      margin: 0;
+      font-size: 15px;
+      letter-spacing: -.1px;
+    }
+
+    .server-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 15px;
+    }
+
+    .server-card {
+      padding: 20px;
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      background: var(--panel);
+      transition: 170ms ease;
+    }
+
+    .server-card:hover {
+      border-color: rgba(114, 151, 232, .3);
+      background: var(--panel-hover);
+    }
+
+    .server-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 16px;
+    }
+
+    .server-identity {
+      display: flex;
+      align-items: center;
+      gap: 13px;
+      min-width: 0;
+    }
+
+    .server-icon {
+      display: grid;
+      flex: 0 0 auto;
+      place-items: center;
+      width: 42px;
+      height: 42px;
+      border: 1px solid rgba(102, 154, 255, .22);
+      border-radius: 12px;
+      color: #dce8ff;
+      font-size: 15px;
+      font-weight: 800;
+      background: linear-gradient(145deg, rgba(65, 122, 245, .28), rgba(99, 70, 179, .18));
+    }
+
+    .server-title {
+      margin-bottom: 4px;
+      font-size: 14px;
+      font-weight: 700;
+    }
+
+    .server-path {
+      max-width: 280px;
+      overflow: hidden;
+      color: #748099;
+      font-family: Consolas, monospace;
+      font-size: 9px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .badge {
+      flex: 0 0 auto;
+      padding: 5px 8px;
+      border-radius: 999px;
+      color: var(--muted);
+      font-size: 9px;
+      font-weight: 700;
+      background: rgba(148, 163, 184, .08);
+    }
+
+    .badge.installed {
+      color: var(--green);
+      background: rgba(81, 215, 164, .09);
+    }
+
+    .server-description {
+      min-height: 38px;
+      margin: 16px 0 15px;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.55;
+    }
+
+    .progress {
+      height: 5px;
+      margin: 14px 0 8px;
+      overflow: hidden;
+      border-radius: 999px;
+      background: rgba(255,255,255,.055);
+    }
+
+    .progress-bar {
+      width: 0%;
+      height: 100%;
+      border-radius: inherit;
+      background: linear-gradient(90deg, var(--blue), var(--violet));
+      transition: width 180ms ease;
+    }
+
+    .progress-copy {
+      display: flex;
+      justify-content: space-between;
+      min-height: 15px;
+      color: #77839b;
+      font-size: 9px;
+    }
+
+    .server-actions {
+      display: flex;
+      gap: 8px;
+      margin-top: 12px;
+    }
+
+    .client-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 13px;
+      margin-bottom: 17px;
+    }
+
+    .client {
+      position: relative;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      min-height: 87px;
+      padding: 17px;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      background: var(--panel);
+      cursor: pointer;
+      transition: 160ms ease;
+    }
+
+    .client:hover, .client.selected {
+      border-color: rgba(103, 148, 248, .36);
+      background: rgba(27, 36, 62, .88);
+    }
+
+    .client input { display: none; }
+
+    .checkmark {
+      display: grid;
+      flex: 0 0 auto;
+      place-items: center;
+      width: 20px;
+      height: 20px;
+      border: 1px solid var(--border-strong);
+      border-radius: 6px;
+      color: transparent;
+      font-size: 11px;
+      background: rgba(0,0,0,.12);
+    }
+
+    .client.selected .checkmark {
+      color: #fff;
+      border-color: #668ef5;
+      background: #557cec;
+    }
+
+    .client-copy { min-width: 0; }
+    .client-name {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 5px;
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .detected {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: #46516a;
+    }
+
+    .detected.yes { background: var(--green); }
+
+    .client-description {
+      margin-bottom: 5px;
+      color: var(--muted);
+      font-size: 10px;
+    }
+
+    .client-path {
+      overflow: hidden;
+      color: #65718a;
+      font-family: Consolas, monospace;
+      font-size: 8px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .config-panel {
+      padding: 20px;
+    }
+
+    .config-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+    }
+
+    .config-row + .config-row {
+      padding-top: 17px;
+      margin-top: 17px;
+      border-top: 1px solid var(--border);
+    }
+
+    .config-title {
+      margin-bottom: 5px;
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .config-description {
+      color: var(--muted);
+      font-size: 10px;
+      line-height: 1.5;
+    }
+
+    .toggle-group {
+      display: flex;
+      gap: 8px;
+    }
+
+    .toggle-chip {
+      padding: 7px 10px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--muted);
+      font-size: 10px;
+      background: rgba(255,255,255,.025);
+      cursor: pointer;
+    }
+
+    .toggle-chip.active {
+      color: #dce8ff;
+      border-color: rgba(99, 144, 244, .42);
+      background: rgba(74, 119, 225, .16);
+    }
+
+    .log-panel {
+      overflow: hidden;
+      border: 1px solid var(--border);
+      border-radius: 15px;
+      background: rgba(7, 10, 18, .72);
+    }
+
+    .log-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 13px 16px;
+      border-bottom: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 10px;
+    }
+
+    .logs {
+      height: 420px;
+      padding: 13px 16px;
+      overflow-y: auto;
+      font-family: "Cascadia Mono", Consolas, monospace;
+      font-size: 10px;
+      line-height: 1.75;
+    }
+
+    .log-line {
+      display: grid;
+      grid-template-columns: 70px 54px 1fr;
+      gap: 8px;
+      color: #9da9c2;
+    }
+
+    .log-time { color: #59657d; }
+    .log-level { color: var(--blue); text-transform: uppercase; }
+    .log-line.error .log-level, .log-line.error .log-message { color: var(--red); }
+    .log-line.success .log-level { color: var(--green); }
+
+    .empty {
+      display: grid;
+      place-items: center;
+      height: 100%;
+      color: #58647c;
+      text-align: center;
+    }
+
+    .toast-stack {
+      position: fixed;
+      z-index: 20;
+      right: 22px;
+      bottom: 20px;
+      display: grid;
+      width: min(360px, calc(100vw - 40px));
+      gap: 9px;
+    }
+
+    .toast {
+      padding: 13px 14px;
+      border: 1px solid var(--border-strong);
+      border-radius: 11px;
+      color: #dce4f7;
+      font-size: 11px;
+      line-height: 1.45;
+      background: rgba(20, 27, 45, .96);
+      box-shadow: var(--shadow);
+      animation: toast-in 200ms ease;
+    }
+
+    .toast.success { border-color: rgba(81, 215, 164, .3); }
+    .toast.error { border-color: rgba(255, 111, 127, .4); }
+
+    @keyframes toast-in {
+      from { opacity: 0; transform: translateY(8px); }
+    }
+
+    .spinner {
+      width: 13px;
+      height: 13px;
+      border: 2px solid rgba(255,255,255,.2);
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: spin .7s linear infinite;
+    }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    @media (max-width: 1040px) {
+      .app { grid-template-columns: 210px 1fr; }
+      .page { padding-left: 26px; padding-right: 26px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">M</div>
+        <div class="brand-copy">
+          <strong>Custom MCPs</strong>
+          <span>INSTALL MANAGER</span>
+        </div>
+      </div>
+
+      <div class="nav-label">Workspace</div>
+      <nav class="nav">
+        <button class="nav-button active" data-page="dashboard">
+          <span class="nav-icon">⌂</span> Overview
+        </button>
+        <button class="nav-button" data-page="install">
+          <span class="nav-icon">↓</span> Install & update
+        </button>
+        <button class="nav-button" data-page="clients">
+          <span class="nav-icon">⚙</span> MCP clients
+        </button>
+        <button class="nav-button" data-page="activity">
+          <span class="nav-icon">≡</span> Activity
+        </button>
+      </nav>
+
+      <div class="sidebar-foot">
+        <div id="connection" class="connection">
+          <span class="connection-dot"></span>
+          <span id="connectionText">Starting Python bridge…</span>
+        </div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <section id="page-dashboard" class="page active">
+        <header class="page-header">
+          <div>
+            <div class="eyebrow">Local MCP toolkit</div>
+            <h1>Everything connected.</h1>
+            <p class="subtitle">Install both MCP servers, keep them current, and connect your AI clients without editing configuration files by hand.</p>
+          </div>
+          <div class="actions">
+            <button class="button" onclick="openFolder()">Open folder</button>
+            <button class="button" onclick="refreshRelease()">Refresh</button>
+          </div>
+        </header>
+
+        <div class="hero-grid">
+          <div class="hero">
+            <div class="hero-badge">◆ GitHub verified releases</div>
+            <h2>One installer for CAD automation and Moodle management.</h2>
+            <p>Downloads are checked with SHA-256, installed locally, and connected to supported MCP clients with backups of every existing configuration.</p>
+            <button id="heroInstall" class="button primary" onclick="installAll()">Install both servers</button>
+          </div>
+
+          <div class="release-panel">
+            <div>
+              <div class="panel-label">Latest release</div>
+              <div id="releaseName" class="release-name">Checking…</div>
+              <div id="releaseMeta" class="release-meta">Connecting to GitHub Releases</div>
+            </div>
+            <div>
+              <div class="status-line">
+                <span id="releaseStatus" class="status-pill">● Loading</span>
+              </div>
+              <button class="button small" style="margin-top:13px" onclick="openRelease()">View on GitHub</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="stats">
+          <div class="stat">
+            <div id="installedCount" class="stat-value">0 / 2</div>
+            <div class="stat-label">SERVERS INSTALLED</div>
+          </div>
+          <div class="stat">
+            <div id="configuredCount" class="stat-value">0</div>
+            <div class="stat-label">CLIENTS CONFIGURED</div>
+          </div>
+          <div class="stat">
+            <div id="detectedCount" class="stat-value">0</div>
+            <div class="stat-label">CLIENTS DETECTED</div>
+          </div>
+        </div>
+
+        <div class="section-title">
+          <h2>Installed servers</h2>
+          <button class="button small" onclick="navigate('install')">Manage</button>
+        </div>
+        <div id="dashboardServers" class="server-grid"></div>
+      </section>
+
+      <section id="page-install" class="page">
+        <header class="page-header">
+          <div>
+            <div class="eyebrow">Release installer</div>
+            <h1>Install & update</h1>
+            <p class="subtitle">Files come directly from the latest <strong>pythonIsFast/custom-mcps</strong> GitHub release and are verified before installation.</p>
+          </div>
+          <div class="actions">
+            <button class="button" onclick="refreshRelease()">Check updates</button>
+            <button class="button primary" onclick="installAll()">Install all</button>
+          </div>
+        </header>
+        <div id="installServers" class="server-grid"></div>
+      </section>
+
+      <section id="page-clients" class="page">
+        <header class="page-header">
+          <div>
+            <div class="eyebrow">One-click configuration</div>
+            <h1>Connect MCP clients</h1>
+            <p class="subtitle">Select clients and servers. Existing settings are preserved, and every changed configuration receives a timestamped backup.</p>
+          </div>
+        </header>
+
+        <div id="clientGrid" class="client-grid"></div>
+
+        <div class="panel config-panel">
+          <div class="config-row">
+            <div>
+              <div class="config-title">Servers to add</div>
+              <div class="config-description">Choose which installed executables should be registered.</div>
+            </div>
+            <div class="toggle-group">
+              <button id="serverToggle-inventor" class="toggle-chip active" onclick="toggleServer('inventor')">Inventor</button>
+              <button id="serverToggle-moodle" class="toggle-chip active" onclick="toggleServer('moodle')">Moodle</button>
+            </div>
+          </div>
+          <div class="config-row">
+            <div>
+              <div class="config-title">Write client configurations</div>
+              <div class="config-description">Restart the selected clients afterwards so they discover the new tools.</div>
+            </div>
+            <button id="configureButton" class="button primary" onclick="configureClients()">Configure selected clients</button>
+          </div>
+          <div class="config-row">
+            <div>
+              <div class="config-title">Moodle login setup</div>
+              <div class="config-description">Opens the secure terminal setup for the installed Moodle server.</div>
+            </div>
+            <button class="button" onclick="runMoodleSetup()">Open setup</button>
+          </div>
+        </div>
+      </section>
+
+      <section id="page-activity" class="page">
+        <header class="page-header">
+          <div>
+            <div class="eyebrow">Diagnostics</div>
+            <h1>Activity log</h1>
+            <p class="subtitle">Download, verification, installation, and configuration events from this session.</p>
+          </div>
+          <button class="button" onclick="clearLogs()">Clear</button>
+        </header>
+        <div class="log-panel">
+          <div class="log-toolbar">
+            <span>SESSION OUTPUT</span>
+            <span id="logCount">0 events</span>
+          </div>
+          <div id="logs" class="logs">
+            <div class="empty">No activity yet.<br>Install a server or configure a client to begin.</div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div id="toasts" class="toast-stack"></div>
+
+  <script>
+    const app = {
+      state: null,
+      release: null,
+      busy: false,
+      initialClientSelectionDone: false,
+      selectedClients: new Set(),
+      selectedServers: new Set(["inventor", "moodle"]),
+      progress: {
+        inventor: { percent: 0, status: "Ready" },
+        moodle: { percent: 0, status: "Ready" }
+      },
+      logs: []
+    };
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+
+    function formatBytes(bytes) {
+      if (!bytes) return "Not installed";
+      const units = ["B", "KB", "MB", "GB"];
+      let value = Number(bytes);
+      let unit = 0;
+      while (value >= 1024 && unit < units.length - 1) {
+        value /= 1024;
+        unit++;
+      }
+      return `${value.toFixed(unit > 1 ? 1 : 0)} ${units[unit]}`;
+    }
+
+    function formatDate(value) {
+      if (!value) return "Publication date unavailable";
+      try {
+        return new Intl.DateTimeFormat(undefined, {
+          year: "numeric", month: "short", day: "numeric",
+          hour: "2-digit", minute: "2-digit"
+        }).format(new Date(value));
+      } catch (_) {
+        return value;
+      }
+    }
+
+    function setConnection(online, text) {
+      const element = document.getElementById("connection");
+      element.classList.toggle("online", online);
+      document.getElementById("connectionText").textContent = text;
+    }
+
+    function navigate(page) {
+      document.querySelectorAll(".page").forEach(el => el.classList.remove("active"));
+      document.querySelectorAll(".nav-button").forEach(el => el.classList.remove("active"));
+      document.getElementById(`page-${page}`).classList.add("active");
+      document.querySelector(`.nav-button[data-page="${page}"]`).classList.add("active");
+    }
+
+    document.querySelectorAll(".nav-button").forEach(button => {
+      button.addEventListener("click", () => navigate(button.dataset.page));
+    });
+
+    function serverCard(server, mode) {
+      const p = app.progress[server.id] || { percent: 0, status: "Ready" };
+      const icon = server.id === "inventor" ? "I" : "M";
+      const installed = Boolean(server.installed);
+      const label = installed ? "Installed" : "Not installed";
+      const action = installed ? "Update" : "Install";
+      const secondary = server.id === "moodle" && installed
+        ? `<button class="button small" onclick="runMoodleSetup()">Login setup</button>`
+        : "";
+
+      return `
+        <article class="server-card">
+          <div class="server-head">
+            <div class="server-identity">
+              <div class="server-icon">${icon}</div>
+              <div style="min-width:0">
+                <div class="server-title">${escapeHtml(server.name)}</div>
+                <div class="server-path" title="${escapeHtml(server.path)}">${escapeHtml(server.path)}</div>
+              </div>
+            </div>
+            <span class="badge ${installed ? "installed" : ""}">${label}</span>
+          </div>
+          <p class="server-description">${escapeHtml(server.description)}</p>
+          <div class="progress"><div id="progress-${mode}-${server.id}" class="progress-bar" style="width:${p.percent}%"></div></div>
+          <div class="progress-copy">
+            <span id="progressStatus-${mode}-${server.id}">${escapeHtml(p.status)}</span>
+            <span>${installed ? `${formatBytes(server.size)} · ${escapeHtml(server.release_tag || "local")}` : ""}</span>
+          </div>
+          <div class="server-actions">
+            <button class="button ${installed ? "" : "primary"} small" onclick="installServer('${server.id}')" ${app.busy ? "disabled" : ""}>${action}</button>
+            ${secondary}
+          </div>
+        </article>`;
+    }
+
+    function renderServers() {
+      if (!app.state) return;
+      const servers = Object.values(app.state.servers);
+      document.getElementById("dashboardServers").innerHTML =
+        servers.map(server => serverCard(server, "dashboard")).join("");
+      document.getElementById("installServers").innerHTML =
+        servers.map(server => serverCard(server, "install")).join("");
+    }
+
+    function renderClients() {
+      if (!app.state) return;
+      const html = app.state.clients.map(client => {
+        const selected = app.selectedClients.has(client.id);
+        const configured = client.configured_servers?.length
+          ? `Configured: ${client.configured_servers.join(", ")}`
+          : "No Custom MCP server configured";
+        return `
+          <label class="client ${selected ? "selected" : ""}" data-client="${client.id}">
+            <input type="checkbox" ${selected ? "checked" : ""} onchange="toggleClient('${client.id}')">
+            <span class="checkmark">✓</span>
+            <span class="client-copy">
+              <span class="client-name">
+                ${escapeHtml(client.name)}
+                <span class="detected ${client.app_detected ? "yes" : ""}" title="${client.app_detected ? "Detected" : "Not detected"}"></span>
+              </span>
+              <span class="client-description">${escapeHtml(configured)}</span>
+              <span class="client-path" title="${escapeHtml(client.path)}">${escapeHtml(client.path)}</span>
+            </span>
+          </label>`;
+      }).join("");
+      document.getElementById("clientGrid").innerHTML = html;
+    }
+
+    function renderRelease() {
+      const release = app.release;
+      const name = document.getElementById("releaseName");
+      const meta = document.getElementById("releaseMeta");
+      const status = document.getElementById("releaseStatus");
+      if (!release) {
+        name.textContent = "Unavailable";
+        meta.textContent = "Refresh to try GitHub again";
+        status.textContent = "● Offline";
+        status.style.color = "var(--red)";
+        return;
+      }
+      name.textContent = release.name || release.tag;
+      meta.textContent = `${release.tag} · ${formatDate(release.published_at)}`;
+      status.textContent = "● Release ready";
+      status.style.color = "var(--green)";
+    }
+
+    function renderStats() {
+      if (!app.state) return;
+      const servers = Object.values(app.state.servers);
+      const clients = app.state.clients;
+      document.getElementById("installedCount").textContent =
+        `${servers.filter(s => s.installed).length} / ${servers.length}`;
+      document.getElementById("configuredCount").textContent =
+        clients.filter(c => c.configured_servers?.length).length;
+      document.getElementById("detectedCount").textContent =
+        clients.filter(c => c.app_detected).length;
+      document.getElementById("heroInstall").textContent =
+        servers.every(s => s.installed) ? "Update both servers" : "Install both servers";
+    }
+
+    function render() {
+      renderServers();
+      renderClients();
+      renderRelease();
+      renderStats();
+      document.getElementById("configureButton").disabled = app.busy;
+    }
+
+    function toggleClient(id) {
+      if (app.selectedClients.has(id)) app.selectedClients.delete(id);
+      else app.selectedClients.add(id);
+      renderClients();
+    }
+
+    function toggleServer(id) {
+      if (app.selectedServers.has(id)) app.selectedServers.delete(id);
+      else app.selectedServers.add(id);
+      document.getElementById(`serverToggle-${id}`).classList.toggle("active", app.selectedServers.has(id));
+    }
+
+    function setBusy(busy) {
+      app.busy = busy;
+      render();
+    }
+
+    function toast(message, type = "") {
+      const container = document.getElementById("toasts");
+      const element = document.createElement("div");
+      element.className = `toast ${type}`;
+      element.textContent = message;
+      container.appendChild(element);
+      setTimeout(() => element.remove(), 4800);
+    }
+
+    function addLog(message, level = "info", timestamp = Date.now() / 1000) {
+      app.logs.push({ message, level, timestamp });
+      if (app.logs.length > 300) app.logs.shift();
+      renderLogs();
+    }
+
+    function renderLogs() {
+      const container = document.getElementById("logs");
+      document.getElementById("logCount").textContent = `${app.logs.length} event${app.logs.length === 1 ? "" : "s"}`;
+      if (!app.logs.length) {
+        container.innerHTML = `<div class="empty">No activity yet.<br>Install a server or configure a client to begin.</div>`;
+        return;
+      }
+      container.innerHTML = app.logs.map(item => {
+        const time = new Date(item.timestamp * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+        return `<div class="log-line ${item.level}">
+          <span class="log-time">${time}</span>
+          <span class="log-level">${escapeHtml(item.level)}</span>
+          <span class="log-message">${escapeHtml(item.message)}</span>
+        </div>`;
+      }).join("");
+      container.scrollTop = container.scrollHeight;
+    }
+
+    function clearLogs() {
+      app.logs = [];
+      renderLogs();
+    }
+
+    window.managerEvent = function(payload) {
+      if (payload.event === "log") {
+        addLog(payload.message, payload.level, payload.timestamp);
+      } else if (payload.event === "progress") {
+        app.progress[payload.server] = {
+          percent: payload.percent || 0,
+          status: payload.status || ""
+        };
+        ["dashboard", "install"].forEach(mode => {
+          const bar = document.getElementById(`progress-${mode}-${payload.server}`);
+          const status = document.getElementById(`progressStatus-${mode}-${payload.server}`);
+          if (bar) bar.style.width = `${payload.percent || 0}%`;
+          if (status) status.textContent = payload.status || "";
+        });
+      } else if (payload.event === "release") {
+        app.release = payload.release;
+        renderRelease();
+      }
+    };
+
+    async function loadState() {
+      const state = await window.pywebview.api.get_state();
+      app.state = state;
+      app.release = state.release;
+      if (!app.initialClientSelectionDone) {
+        state.clients
+          .filter(client => client.app_detected)
+          .forEach(client => app.selectedClients.add(client.id));
+        app.initialClientSelectionDone = true;
+      }
+      render();
+    }
+
+    async function refreshRelease() {
+      document.getElementById("releaseName").textContent = "Checking…";
+      document.getElementById("releaseMeta").textContent = "Connecting to GitHub Releases";
+      const result = await window.pywebview.api.refresh_release();
+      if (result.ok) {
+        app.release = result.release;
+        toast(`Latest release: ${result.release.tag}`, "success");
+      } else {
+        toast(result.error, "error");
+      }
+      renderRelease();
+    }
+
+    async function installServer(id) {
+      if (app.busy) return;
+      setBusy(true);
+      const result = await window.pywebview.api.install_server(id);
+      if (result.ok) toast(`${id === "inventor" ? "Inventor" : "Moodle"} MCP installed.`, "success");
+      else toast(result.error || "Installation failed.", "error");
+      await loadState();
+      setBusy(false);
+    }
+
+    async function installAll() {
+      if (app.busy) return;
+      setBusy(true);
+      const result = await window.pywebview.api.install_all();
+      if (result.ok) toast("Both MCP servers are installed.", "success");
+      else toast(result.error || "Installation failed.", "error");
+      await loadState();
+      setBusy(false);
+    }
+
+    async function configureClients() {
+      if (!app.selectedClients.size) {
+        toast("Select at least one MCP client.", "error");
+        return;
+      }
+      if (!app.selectedServers.size) {
+        toast("Select at least one MCP server.", "error");
+        return;
+      }
+      setBusy(true);
+      const result = await window.pywebview.api.configure_clients(
+        Array.from(app.selectedClients),
+        Array.from(app.selectedServers)
+      );
+      if (result.ok) {
+        const names = result.configured.map(item => item.name).join(", ");
+        toast(`Configured ${names}. Restart the clients to connect.`, "success");
+        await loadState();
+      } else {
+        toast(result.error || "Configuration failed.", "error");
+      }
+      setBusy(false);
+    }
+
+    async function openFolder() {
+      const result = await window.pywebview.api.open_install_folder();
+      if (!result.ok) toast(result.error, "error");
+    }
+
+    async function openRelease() {
+      const result = await window.pywebview.api.open_release_page();
+      if (!result.ok) toast(result.error, "error");
+    }
+
+    async function runMoodleSetup() {
+      const result = await window.pywebview.api.run_moodle_setup();
+      if (result.ok) toast("Moodle setup opened in a new terminal.", "success");
+      else toast(result.error, "error");
+    }
+
+    async function boot() {
+      try {
+        setConnection(true, "Python bridge connected");
+        addLog("Custom MCP Manager started.", "success");
+        await loadState();
+        await refreshRelease();
+      } catch (error) {
+        setConnection(false, "Bridge error");
+        addLog(String(error), "error");
+        toast(`Startup failed: ${error}`, "error");
+      }
+    }
+
+    window.addEventListener("pywebviewready", boot);
+  </script>
+</body>
+</html>

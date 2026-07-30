@@ -9,6 +9,9 @@ on:
     paths:
       - inventor_mcp_server.py
       - moodle_mcp_server.py
+      - installer_manager.py
+      - installer_ui/**
+      - tests/**
       - .github/workflows/build-inventor-exe.yml
 
 permissions:
@@ -38,11 +41,13 @@ jobs:
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          python -m pip install "mcp[cli]" "fastmcp>=3,<4" requests beautifulsoup4 keyring pywin32 pyinstaller
+          python -m pip install "mcp[cli]" "fastmcp>=3,<4" requests beautifulsoup4 keyring pywin32 pyinstaller pywebview
 
       - name: Validate sources
         shell: pwsh
-        run: python -m py_compile inventor_mcp_server.py moodle_mcp_server.py
+        run: |
+          python -m py_compile inventor_mcp_server.py moodle_mcp_server.py installer_manager.py
+          python -m unittest discover -s tests -v
 
       - name: Build Inventor executable
         shell: pwsh
@@ -68,12 +73,26 @@ jobs:
             --collect-submodules keyring.backends `
             moodle_mcp_server.py
 
+      - name: Build installer manager
+        shell: pwsh
+        run: |
+          pyinstaller `
+            --clean `
+            --noconfirm `
+            --onefile `
+            --windowed `
+            --name custom-mcp-manager `
+            --add-data "installer_ui;installer_ui" `
+            --collect-all webview `
+            installer_manager.py
+
       - name: Verify executables
         shell: pwsh
         run: |
           $artifacts = @(
             "dist/inventor-mcp-server.exe",
-            "dist/moodle-mcp-server.exe"
+            "dist/moodle-mcp-server.exe",
+            "dist/custom-mcp-manager.exe"
           )
           foreach ($path in $artifacts) {
             $artifact = Get-Item -LiteralPath $path
@@ -88,6 +107,7 @@ jobs:
           path: |
             dist/inventor-mcp-server.exe
             dist/moodle-mcp-server.exe
+            dist/custom-mcp-manager.exe
           if-no-files-found: error
           retention-days: 30
 
@@ -105,6 +125,7 @@ jobs:
           Included executables:
           - inventor-mcp-server.exe
           - moodle-mcp-server.exe
+          - custom-mcp-manager.exe
 
           These binaries are experimental. Test them before using important
           Moodle data or production CAD documents.
@@ -113,6 +134,7 @@ jobs:
           gh release create $tag `
             "dist/inventor-mcp-server.exe" `
             "dist/moodle-mcp-server.exe" `
+            "dist/custom-mcp-manager.exe" `
             --target $env:GITHUB_SHA `
             --title $title `
             --notes $notes

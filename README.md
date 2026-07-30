@@ -13,6 +13,39 @@ Two local Model Context Protocol servers for controlling **Autodesk Inventor** a
 | --- | --- | --- |
 | [`inventor_mcp_server.py`](./inventor_mcp_server.py) | Controls Autodesk Inventor through its COM API | Windows |
 | [`moodle_mcp_server.py`](./moodle_mcp_server.py) | Manages Moodle through a normal login session, internal AJAX calls, and HTML forms | Windows, Linux, WSL |
+| [`installer_manager.py`](./installer_manager.py) | Installs release builds and configures supported MCP clients through a local HTML UI | Windows |
+
+## 🚀 Custom MCP Manager
+
+The easiest way to get started is the **Custom MCP Manager**, a local desktop
+application built with an HTML interface and a Python bridge.
+
+### Manager features
+
+- Downloads the latest executables directly from GitHub Releases
+- Streams downloads with live progress
+- Verifies GitHub-provided SHA-256 asset digests
+- Installs files atomically in `%LOCALAPPDATA%\CustomMCPs\bin`
+- Detects Codex, Claude Desktop, Cursor, and Visual Studio Code
+- Configures selected clients and servers with one click
+- Preserves unrelated client settings
+- Creates timestamped backups before changing existing configurations
+- Opens Moodle's secure terminal login setup
+- Keeps an in-app activity log for troubleshooting
+
+Download `custom-mcp-manager.exe` from the latest release and run it. No Python
+installation is required for the prebuilt manager.
+
+To run it from source:
+
+```powershell
+python -m pip install requests pywebview
+python installer_manager.py
+```
+
+> [!NOTE]
+> Restart an MCP client after configuring it so the client discovers the newly
+> installed servers.
 
 ## 🛠️ Autodesk Inventor MCP
 
@@ -194,11 +227,13 @@ The executable will be created in the `dist` directory.
 ### Download prebuilt executables
 
 Whenever `inventor_mcp_server.py` or `moodle_mcp_server.py` changes on `main`,
-GitHub Actions builds both Windows x64 executables and creates a new GitHub
+or when the installer manager changes, GitHub Actions builds all three Windows
+x64 executables and creates a new GitHub
 Release:
 
 - `inventor-mcp-server.exe`
 - `moodle-mcp-server.exe`
+- `custom-mcp-manager.exe`
 
 Download them from the repository's **Releases** page. Each release uses a
 unique `build-<run number>-<commit>` tag. The same files are also available as a
