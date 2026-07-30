@@ -1,5 +1,6 @@
 name: Build Inventor MCP executable
 
+# Produces a portable Windows x64 artifact for MCP clients.
 on:
   workflow_dispatch:
   push:
