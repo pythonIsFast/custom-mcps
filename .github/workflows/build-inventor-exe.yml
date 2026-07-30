@@ -1,0 +1,72 @@
+name: Build Inventor MCP executable
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - inventor_mcp_server.py
+      - how_to_build.txt
+      - .github/workflows/build-inventor-exe.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: inventor-exe-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Windows executable
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          architecture: x64
+          cache: pip
+
+      - name: Install build dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "mcp[cli]" pywin32 pyinstaller
+
+      - name: Validate source
+        shell: pwsh
+        run: python -m py_compile inventor_mcp_server.py
+
+      - name: Build executable
+        shell: pwsh
+        run: |
+          pyinstaller `
+            --clean `
+            --noconfirm `
+            --onefile `
+            --name inventor-mcp-server `
+            --hidden-import win32timezone `
+            --hidden-import win32com.gen_py `
+            inventor_mcp_server.py
+
+      - name: Verify executable
+        shell: pwsh
+        run: |
+          $artifact = Get-Item -LiteralPath "dist/inventor-mcp-server.exe"
+          Write-Host "Built $($artifact.FullName) ($($artifact.Length) bytes)"
+          Get-FileHash -LiteralPath $artifact.FullName -Algorithm SHA256
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: inventor-mcp-server-windows-x64
+          path: dist/inventor-mcp-server.exe
+          if-no-files-found: error
+          retention-days: 30
