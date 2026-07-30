@@ -1,6 +1,6 @@
 # 🧩 Custom MCP Servers
 
-[![Build Inventor MCP executable](https://github.com/pythonIsFast/custom-mcps/actions/workflows/build-inventor-exe.yml/badge.svg)](https://github.com/pythonIsFast/custom-mcps/actions/workflows/build-inventor-exe.yml)
+[![Build and release MCP executables](https://github.com/pythonIsFast/custom-mcps/actions/workflows/build-inventor-exe.yml/badge.svg)](https://github.com/pythonIsFast/custom-mcps/actions/workflows/build-inventor-exe.yml)
 
 Two local Model Context Protocol servers for controlling **Autodesk Inventor** and managing **Moodle without Web Service tokens**. Build CAD models through Inventor's COM API or work with Moodle courses through an authenticated browser-style session.
 
@@ -191,18 +191,21 @@ pyinstaller --onefile --name inventor-mcp-server --hidden-import win32timezone -
 
 The executable will be created in the `dist` directory.
 
-### Download a GitHub Actions build
+### Download prebuilt executables
 
-The repository automatically builds the Windows executable when the Inventor
-server or its build workflow changes on `main`.
+Whenever `inventor_mcp_server.py` or `moodle_mcp_server.py` changes on `main`,
+GitHub Actions builds both Windows x64 executables and creates a new GitHub
+Release:
 
-1. Open the repository's **Actions** tab.
-2. Select **Build Inventor MCP executable**.
-3. Open a successful workflow run.
-4. Download the `inventor-mcp-server-windows-x64` artifact.
+- `inventor-mcp-server.exe`
+- `moodle-mcp-server.exe`
 
-The workflow can also be started manually with **Run workflow**. Build artifacts
-are retained for 30 days.
+Download them from the repository's **Releases** page. Each release uses a
+unique `build-<run number>-<commit>` tag. The same files are also available as a
+workflow artifact for 30 days.
+
+The workflow can be started manually from **Actions → Build and release MCP
+executables → Run workflow**.
 
 ## 🧪 Project status and limitations
 

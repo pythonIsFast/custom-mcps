@@ -1,6 +1,6 @@
-name: Build Inventor MCP executable
+name: Build and release MCP executables
 
-# Produces a portable Windows x64 artifact for MCP clients.
+# Produces portable Windows x64 executables and publishes a release.
 on:
   workflow_dispatch:
   push:
@@ -8,21 +8,21 @@ on:
       - main
     paths:
       - inventor_mcp_server.py
-      - how_to_build.txt
+      - moodle_mcp_server.py
       - .github/workflows/build-inventor-exe.yml
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
-  group: inventor-exe-${{ github.ref }}
-  cancel-in-progress: true
+  group: mcp-release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  build:
-    name: Build Windows executable
+  build-and-release:
+    name: Build and release Windows executables
     runs-on: windows-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: Check out repository
@@ -39,13 +39,13 @@ jobs:
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          python -m pip install "mcp[cli]" pywin32 pyinstaller
+          python -m pip install "mcp[cli]" "fastmcp>=3,<4" requests beautifulsoup4 keyring pywin32 pyinstaller
 
-      - name: Validate source
+      - name: Validate sources
         shell: pwsh
-        run: python -m py_compile inventor_mcp_server.py
+        run: python -m py_compile inventor_mcp_server.py moodle_mcp_server.py
 
-      - name: Build executable
+      - name: Build Inventor executable
         shell: pwsh
         run: |
           pyinstaller `
@@ -57,17 +57,63 @@ jobs:
             --hidden-import win32com.gen_py `
             inventor_mcp_server.py
 
-      - name: Verify executable
+      - name: Build Moodle executable
         shell: pwsh
         run: |
-          $artifact = Get-Item -LiteralPath "dist/inventor-mcp-server.exe"
-          Write-Host "Built $($artifact.FullName) ($($artifact.Length) bytes)"
-          Get-FileHash -LiteralPath $artifact.FullName -Algorithm SHA256
+          pyinstaller `
+            --clean `
+            --noconfirm `
+            --onefile `
+            --name moodle-mcp-server `
+            --hidden-import tkinter `
+            --collect-submodules keyring.backends `
+            moodle_mcp_server.py
 
-      - name: Upload executable
+      - name: Verify executables
+        shell: pwsh
+        run: |
+          $artifacts = @(
+            "dist/inventor-mcp-server.exe",
+            "dist/moodle-mcp-server.exe"
+          )
+          foreach ($path in $artifacts) {
+            $artifact = Get-Item -LiteralPath $path
+            Write-Host "Built $($artifact.FullName) ($($artifact.Length) bytes)"
+            Get-FileHash -LiteralPath $artifact.FullName -Algorithm SHA256
+          }
+
+      - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: inventor-mcp-server-windows-x64
-          path: dist/inventor-mcp-server.exe
+          name: custom-mcp-servers-windows-x64
+          path: |
+            dist/inventor-mcp-server.exe
+            dist/moodle-mcp-server.exe
           if-no-files-found: error
           retention-days: 30
+
+      - name: Create GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $shortSha = $env:GITHUB_SHA.Substring(0, 7)
+          $tag = "build-$env:GITHUB_RUN_NUMBER-$shortSha"
+          $title = "Custom MCP Servers build $env:GITHUB_RUN_NUMBER"
+          $notes = @"
+          Automated Windows x64 build from commit $env:GITHUB_SHA.
+
+          Included executables:
+          - inventor-mcp-server.exe
+          - moodle-mcp-server.exe
+
+          These binaries are experimental. Test them before using important
+          Moodle data or production CAD documents.
+          "@
+
+          gh release create $tag `
+            "dist/inventor-mcp-server.exe" `
+            "dist/moodle-mcp-server.exe" `
+            --target $env:GITHUB_SHA `
+            --title $title `
+            --notes $notes
