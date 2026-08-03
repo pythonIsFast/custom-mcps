@@ -231,13 +231,14 @@ The executable will be created in the `dist` directory.
 ### Download prebuilt executables
 
 Whenever `inventor_mcp_server.py` or `moodle_mcp_server.py` changes on `main`,
-or when the installer manager changes, GitHub Actions builds all three Windows
-x64 executables and creates a new GitHub
-Release:
+or when the installer manager changes, GitHub Actions builds Windows x64
+executables for all components plus a Linux x64 executable for Moodle, then
+creates a new GitHub Release:
 
 - `inventor-mcp-server.exe`
 - `moodle-mcp-server.exe`
 - `custom-mcp-manager.exe`
+- `moodle-mcp-server-linux-x64`
 - `SHA256SUMS.txt`
 
 Download them from the repository's **Releases** page. Releases use semantic
