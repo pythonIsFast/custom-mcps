@@ -1,6 +1,6 @@
 name: Build and release MCP executables
 
-# Produces portable Windows x64 executables and publishes a release.
+# Produces portable Windows x64 executables plus a Linux Moodle binary and publishes a release.
 on:
   workflow_dispatch:
   push:
@@ -24,8 +24,8 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build-and-release:
-    name: Build and release Windows executables
+  build-windows:
+    name: Build Windows executables
     runs-on: windows-latest
     timeout-minutes: 20
 
@@ -106,18 +106,6 @@ jobs:
             Get-FileHash -LiteralPath $artifact.FullName -Algorithm SHA256
           }
 
-      - name: Create SHA-256 checksums
-        shell: pwsh
-        run: |
-          $checksums = Get-ChildItem -LiteralPath dist -Filter "*.exe" |
-            Sort-Object Name |
-            ForEach-Object {
-              $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-              "$hash  $($_.Name)"
-            }
-          $checksums | Set-Content -LiteralPath "dist/SHA256SUMS.txt" -Encoding utf8NoBOM
-          Get-Content -LiteralPath "dist/SHA256SUMS.txt"
-
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -126,9 +114,109 @@ jobs:
             dist/inventor-mcp-server.exe
             dist/moodle-mcp-server.exe
             dist/custom-mcp-manager.exe
-            dist/SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 30
+
+  build-linux-moodle:
+    name: Build Linux Moodle executable
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          architecture: x64
+
+      - name: Install OS dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "mcp[cli]" "fastmcp>=3,<4" requests beautifulsoup4 keyring pyinstaller
+
+      - name: Validate Moodle source
+        run: |
+          python -m py_compile moodle_mcp_server.py
+          python -m unittest discover -s tests -p "test_moodle_courses.py" -v
+
+      - name: Build Linux Moodle executable
+        run: |
+          pyinstaller \
+            --clean \
+            --noconfirm \
+            --onefile \
+            --name moodle-mcp-server-linux-x64 \
+            --hidden-import tkinter \
+            --collect-submodules keyring.backends \
+            moodle_mcp_server.py
+
+      - name: Verify Linux executable
+        run: |
+          ls -lh dist/moodle-mcp-server-linux-x64
+          sha256sum dist/moodle-mcp-server-linux-x64
+
+      - name: Upload Linux Moodle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: moodle-mcp-server-linux-x64
+          path: dist/moodle-mcp-server-linux-x64
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Create GitHub release
+    runs-on: windows-latest
+    timeout-minutes: 20
+    needs:
+      - build-windows
+      - build-linux-moodle
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Download Windows build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: custom-mcp-servers-windows-x64
+          path: dist
+
+      - name: Download Linux Moodle artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: moodle-mcp-server-linux-x64
+          path: dist
+
+      - name: Verify release assets
+        shell: pwsh
+        run: |
+          Get-ChildItem -LiteralPath dist -File | ForEach-Object {
+            Write-Host "Built $($_.FullName) ($($_.Length) bytes)"
+            Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256
+          }
+
+      - name: Create SHA-256 checksums
+        shell: pwsh
+        run: |
+          $checksums = Get-ChildItem -LiteralPath dist -File |
+            Where-Object { $_.Name -ne "SHA256SUMS.txt" } |
+            Sort-Object Name |
+            ForEach-Object {
+              $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              "$hash  $($_.Name)"
+            }
+          $checksums | Set-Content -LiteralPath "dist/SHA256SUMS.txt" -Encoding utf8NoBOM
+          Get-Content -LiteralPath "dist/SHA256SUMS.txt"
 
       - name: Create GitHub release
         shell: pwsh
@@ -200,7 +288,8 @@ jobs:
           | **custom-mcp-manager.exe** | Recommended installer and client configuration UI |
           | **inventor-mcp-server.exe** | Autodesk Inventor MCP server |
           | **moodle-mcp-server.exe** | Moodle MCP server |
-          | **SHA256SUMS.txt** | SHA-256 checksums for all executables |
+          | **moodle-mcp-server-linux-x64** | Moodle MCP server for Linux x64 |
+          | **SHA256SUMS.txt** | SHA-256 checksums for all release assets |
 
           ## 🔐 Verify your download
 
@@ -224,6 +313,7 @@ jobs:
             "dist/inventor-mcp-server.exe" `
             "dist/moodle-mcp-server.exe" `
             "dist/custom-mcp-manager.exe" `
+            "dist/moodle-mcp-server-linux-x64" `
             "dist/SHA256SUMS.txt" `
             --target $env:GITHUB_SHA `
             --title $title `
