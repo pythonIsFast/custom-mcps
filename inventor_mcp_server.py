@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import math
 import sys
+import uuid
 
 # --- MCP SDK ---------------------------------------------------------------
 try:
@@ -602,6 +603,93 @@ def _safe_constrain(fn):
 
 
 # ---------------------------------------------------------------------------
+# Stabile Geometrie-Handles
+# ---------------------------------------------------------------------------
+_GEOMETRY_ATTRIBUTE_SET = "CustomMcpGeometry"
+_GEOMETRY_ATTRIBUTE = "GeometryId"
+
+
+def _get_geometry_id(entity, prefix: str) -> str:
+    """Liest oder vergibt eine persistente ID auf einer Inventor-Entitaet.
+
+    AttributeSets werden von Inventor an der jeweiligen Face/Edge gespeichert
+    und sind dadurch deutlich robuster als die laufenden Collection-Indizes.
+    Bei Topologie-Neuberechnung kann Inventor Attribute trotzdem verwerfen;
+    der Aufrufer sollte in diesem Fall die Faces erneut auflisten.
+    """
+    try:
+        sets = entity.AttributeSets
+        for i in range(1, sets.Count + 1):
+            attr_set = sets.Item(i)
+            if attr_set.Name != _GEOMETRY_ATTRIBUTE_SET:
+                continue
+            try:
+                return str(attr_set.Item(_GEOMETRY_ATTRIBUTE).Value)
+            except Exception:
+                break
+
+        attr_set = sets.Add(_GEOMETRY_ATTRIBUTE_SET)
+        value = f"{prefix}_{uuid.uuid4().hex}"
+        attr_set.Add(_GEOMETRY_ATTRIBUTE, _const.kStringType, value)
+        return value
+    except Exception as exc:
+        raise RuntimeError(
+            "Inventor konnte keinen stabilen Geometrie-Handle speichern. "
+            f"Entitaet ist moeglicherweise nicht attributierbar: {exc}"
+        ) from exc
+
+
+def _find_face_by_geometry_id(body, geometry_id: str):
+    for i in range(1, body.Faces.Count + 1):
+        face = body.Faces.Item(i)
+        try:
+            if _get_geometry_id(face, "face") == geometry_id:
+                return face
+        except Exception:
+            continue
+    return None
+
+
+def _find_edge_by_geometry_id(body, geometry_id: str):
+    for i in range(1, body.Edges.Count + 1):
+        edge = body.Edges.Item(i)
+        try:
+            if _get_geometry_id(edge, "edge") == geometry_id:
+                return edge
+        except Exception:
+            continue
+    return None
+
+
+def _resolve_face_reference(body, reference: str):
+    """Loest eine stabile Face-ID auf; numerische Indizes bleiben legacy."""
+    reference = str(reference).strip()
+    if reference.isdigit():
+        index = int(reference)
+        if index < 1 or index > body.Faces.Count:
+            raise ValueError(f"Flaechen-Index {index} ungueltig.")
+        return body.Faces.Item(index), "legacy-index"
+    face = _find_face_by_geometry_id(body, reference)
+    if face is None:
+        raise ValueError(f"Flaechen-ID '{reference}' nicht gefunden.")
+    return face, "geometry-id"
+
+
+def _resolve_edge_reference(body, reference: str):
+    """Loest eine stabile Edge-ID auf; numerische Indizes bleiben legacy."""
+    reference = str(reference).strip()
+    if reference.isdigit():
+        index = int(reference)
+        if index < 1 or index > body.Edges.Count:
+            raise ValueError(f"Kanten-Index {index} ungueltig.")
+        return body.Edges.Item(index), "legacy-index"
+    edge = _find_edge_by_geometry_id(body, reference)
+    if edge is None:
+        raise ValueError(f"Kanten-ID '{reference}' nicht gefunden.")
+    return edge, "geometry-id"
+
+
+# ---------------------------------------------------------------------------
 # MCP-Tools
 # ---------------------------------------------------------------------------
 @mcp.tool()
@@ -987,6 +1075,190 @@ def extrude_cut(
     )
 
 
+def _geometry_value(item: dict, *names: str, required: bool = True, default=None):
+    for name in names:
+        if name in item:
+            return float(item[name])
+    if required:
+        raise ValueError(f"Geometrie-Feld fehlt: eines von {', '.join(names)}")
+    return default
+
+
+def _add_generic_sketch_geometry(app, sketch, geometry: list[dict]):
+    """Fuegt einfache, geschlossene oder offene 2D-Geometrie hinzu."""
+    tg = app.TransientGeometry
+    created = []
+    for number, item in enumerate(geometry, start=1):
+        if not isinstance(item, dict):
+            raise ValueError(f"Geometrie #{number} muss ein Objekt sein.")
+        kind = str(item.get("type", "")).strip().lower()
+        construction = bool(item.get("construction", False))
+
+        if kind == "line":
+            start = tg.CreatePoint2d(
+                _mm_to_cm(_geometry_value(item, "x1_mm", "start_x_mm")),
+                _mm_to_cm(_geometry_value(item, "y1_mm", "start_y_mm")),
+            )
+            end = tg.CreatePoint2d(
+                _mm_to_cm(_geometry_value(item, "x2_mm", "end_x_mm")),
+                _mm_to_cm(_geometry_value(item, "y2_mm", "end_y_mm")),
+            )
+            entity = sketch.SketchLines.AddByTwoPoints(start, end)
+        elif kind == "circle":
+            center = tg.CreatePoint2d(
+                _mm_to_cm(_geometry_value(item, "x_mm", "center_x_mm")),
+                _mm_to_cm(_geometry_value(item, "y_mm", "center_y_mm")),
+            )
+            radius_mm = _geometry_value(item, "radius_mm")
+            if radius_mm <= 0:
+                raise ValueError("Kreisradius muss groesser als 0 sein.")
+            entity = sketch.SketchCircles.AddByCenterRadius(
+                center, _mm_to_cm(radius_mm)
+            )
+        elif kind == "rectangle":
+            x1 = _geometry_value(item, "x1_mm", "left_mm")
+            y1 = _geometry_value(item, "y1_mm", "bottom_mm")
+            x2 = _geometry_value(item, "x2_mm", "right_mm")
+            y2 = _geometry_value(item, "y2_mm", "top_mm")
+            if x1 == x2 or y1 == y2:
+                raise ValueError("Rechteck muss eine positive Flaeche haben.")
+            entity = sketch.SketchLines.AddAsTwoPointRectangle(
+                tg.CreatePoint2d(_mm_to_cm(x1), _mm_to_cm(y1)),
+                tg.CreatePoint2d(_mm_to_cm(x2), _mm_to_cm(y2)),
+            )
+        elif kind in ("polyline", "polygon"):
+            points = item.get("points")
+            if not isinstance(points, list) or len(points) < 2:
+                raise ValueError("Eine Polylinie braucht mindestens zwei Punkte.")
+            point_objects = []
+            for point in points:
+                if isinstance(point, dict):
+                    px = _geometry_value(point, "x_mm", "x")
+                    py = _geometry_value(point, "y_mm", "y")
+                elif isinstance(point, (list, tuple)) and len(point) == 2:
+                    px, py = float(point[0]), float(point[1])
+                else:
+                    raise ValueError("Polylinienpunkte muessen [x, y] oder Objekte sein.")
+                point_objects.append(tg.CreatePoint2d(_mm_to_cm(px), _mm_to_cm(py)))
+            first = point_objects[0]
+            previous = first
+            entity = None
+            for target in point_objects[1:]:
+                entity = sketch.SketchLines.AddByTwoPoints(previous, target)
+                previous = target
+            if kind == "polygon":
+                entity = sketch.SketchLines.AddByTwoPoints(previous, first)
+        else:
+            raise ValueError(
+                f"Unbekannter Geometrietyp '{kind}'. Erlaubt: line, circle, "
+                "rectangle, polyline, polygon."
+            )
+
+        if construction:
+            try:
+                entity.Construction = True
+            except Exception:
+                # Rechtecke/Polylinien liefern Collections bzw. die letzte
+                # Linie; Konstruktion ist deshalb best-effort.
+                pass
+        created.append(kind)
+    return created
+
+
+def _find_sketch(comp_def, sketch_name: str):
+    try:
+        return comp_def.Sketches.Item(sketch_name)
+    except Exception:
+        for i in range(1, comp_def.Sketches.Count + 1):
+            sketch = comp_def.Sketches.Item(i)
+            if sketch.Name == sketch_name:
+                return sketch
+    raise RuntimeError(f"Skizze '{sketch_name}' nicht gefunden.")
+
+
+@mcp.tool()
+def create_sketch(
+    geometry: list[dict],
+    plane: str = "XY",
+    name: str = "",
+) -> dict:
+    """Erstellt eine frei definierbare 2D-Skizze.
+
+    ``geometry`` ist eine Liste aus ``line``, ``circle``, ``rectangle``,
+    ``polyline`` oder ``polygon``. Koordinaten und Radien werden in mm
+    angegeben. Beispiel: ``[{"type":"rectangle","x1_mm":0,
+    "y1_mm":0,"x2_mm":40,"y2_mm":20}]``.
+    """
+    if not geometry:
+        raise ValueError("Mindestens ein Geometrieelement ist erforderlich.")
+    app = _get_app()
+    doc = _require_part_document(app)
+    doc.Activate()
+    sketch = doc.ComponentDefinition.Sketches.Add(
+        _resolve_work_plane(doc.ComponentDefinition, plane)
+    )
+    if name.strip():
+        sketch.Name = name.strip()
+    created = _add_generic_sketch_geometry(app, sketch, geometry)
+    return {
+        "name": sketch.Name,
+        "plane": plane,
+        "geometry_count": len(created),
+        "geometry_types": created,
+        "profile_ready": True,
+    }
+
+
+@mcp.tool()
+def extrude_sketch(
+    sketch_name: str,
+    distance_mm: float,
+    operation: str = "new",
+    direction: str = "positive",
+) -> str:
+    """Extrudiert eine vorhandene generische Skizze.
+
+    ``operation`` ist ``new``, ``join`` oder ``cut``. Die Skizze muss ein
+    geschlossenes Solid-Profil enthalten; Konstruktionsgeometrie wird von
+    Inventor beim Profilaufbau ignoriert.
+    """
+    if distance_mm <= 0:
+        raise ValueError("Die Extrusionsdistanz muss groesser als 0 sein.")
+    op_map = {
+        "new": _const.kNewBodyOperation,
+        "join": _const.kJoinOperation,
+        "cut": _const.kCutOperation,
+    }
+    operation_key = operation.strip().lower()
+    if operation_key not in op_map:
+        raise ValueError("operation muss 'new', 'join' oder 'cut' sein.")
+    app = _get_app()
+    doc = _require_part_document(app)
+    doc.Activate()
+    comp_def = doc.ComponentDefinition
+    sketch = _find_sketch(comp_def, sketch_name)
+    try:
+        profile = sketch.Profiles.AddForSolid()
+    except Exception as exc:
+        raise RuntimeError(
+            f"Skizze '{sketch_name}' konnte nicht als Solid-Profil verwendet werden. "
+            "Ist sie geschlossen?"
+        ) from exc
+    ext_def = comp_def.Features.ExtrudeFeatures.CreateExtrudeDefinition(
+        profile, op_map[operation_key]
+    )
+    ext_def.SetDistanceExtent(_mm_to_cm(distance_mm), _parse_direction(direction))
+    feature = comp_def.Features.ExtrudeFeatures.Add(ext_def)
+    try:
+        feature_name = feature.Name
+    except Exception:
+        feature_name = "Extrusion"
+    return (
+        f"Skizze '{sketch_name}' extrudiert: {distance_mm} mm, "
+        f"Operation '{operation_key}', Richtung '{direction}', Feature '{feature_name}'."
+    )
+
+
 @mcp.tool()
 def add_hole(
     x_mm: float,
@@ -1237,13 +1509,15 @@ def _constrain_hole_point(sketch, comp_def, pt, cx_cm, cy_cm, tg):
         else:
             status = "teilweise"
     return status
-    """
-    Verrundet Kanten des ersten Volumenkoerpers mit gegebenem Radius.
 
-    Args:
-        radius_mm: Verrundungsradius (mm).
-        edges:     Welche Kanten: "all" (Standard), "top", "bottom" oder
-                   "vertical".
+
+@mcp.tool()
+def add_fillet(radius_mm: float, edges: str = "all") -> str:
+    """Verrundet Kanten des ersten Volumenkoerpers mit einem Radius.
+
+    ``edges`` akzeptiert ``all``, ``top``, ``bottom`` und ``vertical`` sowie
+    stabile Referenzen im Format ``face_id/edge_id``. Die alte Schreibweise
+    ``F1:E1`` bleibt aus Kompatibilitaetsgruenden verfuegbar.
     """
     if radius_mm <= 0:
         raise ValueError("Radius muss groesser als 0 sein.")
@@ -1755,7 +2029,7 @@ def list_faces() -> list:
     result = []
     for i in range(1, body.Faces.Count + 1):
         face = body.Faces.Item(i)
-        info = {"index": i}
+        info = {"index": i, "geometry_id": _get_geometry_id(face, "face")}
         try:
             st = face.SurfaceType
             info["surface_type"] = _surface_types.get(st, f"unknown({st})")
@@ -1991,14 +2265,14 @@ def change_sketch_plane(feature_name: str, plane: str) -> str:
 # KANTENAUSWAHL AN FLAECHEN
 # ===========================================================================
 @mcp.tool()
-def list_face_edges(face_index: int = 1) -> list:
+def list_face_edges(face_index: str = "1") -> list:
     """
     Listet die Kanten einer Flaechen des ersten Volumenkoerpers auf.
     Liefert Index, Typ (gerade/kruemm), Z-Start, Z-Stop pro Kante.
 
     Args:
-        face_index: Index der Flaeche (1-basiert, wie in Inventor).
-                    Standard: 1 (erste Flaeche).
+        face_index: Stabile Flaechen-ID aus 'list_faces'. Eine numerische
+                    Angabe bleibt als legacy Index erlaubt.
     """
     app = _get_app()
     doc = _require_part_document(app)
@@ -2008,17 +2282,15 @@ def list_face_edges(face_index: int = 1) -> list:
         raise RuntimeError("Kein Volumenkoerper vorhanden.")
 
     body = comp_def.SurfaceBodies.Item(1)
-    if face_index < 1 or face_index > body.Faces.Count:
-        raise ValueError(
-            f"Flaechen-Index {face_index} ungueltig. "
-            f"Verfuegbare Indizes: 1 bis {body.Faces.Count}."
-        )
-
-    face = body.Faces.Item(face_index)
+    face, reference_kind = _resolve_face_reference(body, str(face_index))
     result = []
     for i in range(1, face.Edges.Count + 1):
         edge = face.Edges.Item(i)
-        info = {"index": i}
+        info = {
+            "index": i,
+            "geometry_id": _get_geometry_id(edge, "edge"),
+            "face_reference_kind": reference_kind,
+        }
         try:
             geom_type = edge.GeometryType
             info["geometry_type"] = geom_type
@@ -2073,7 +2345,8 @@ def _build_edge_collection(app, comp_def, edge_specs: str):
     """
     Baut eine EdgeCollection aus einer Spezifikation.
     edge_specs: Kommagetrennte Liste von Angaben wie:
-        "F1:E1,F1:E3"     -> Flaeche 1, Kante 1 und 3
+        "face_id/edge_id" -> stabile Flaechen- und Kanten-ID
+        "F1:E1,F1:E3"     -> legacy Indexe
         "top"              -> alle oberen Kanten (wie bei fillet/chamfer)
         "bottom"           -> alle unteren Kanten
         "vertical"         -> alle senkrechten Kanten
@@ -2089,23 +2362,43 @@ def _build_edge_collection(app, comp_def, edge_specs: str):
     parts = [p.strip() for p in edge_specs.split(",") if p.strip()]
 
     for part in parts:
+        if "/" in part:
+            face_ref, edge_ref = [value.strip() for value in part.split("/", 1)]
+            face, _ = _resolve_face_reference(body, face_ref)
+            edge, _ = _resolve_edge_reference(body, edge_ref)
+            # Verhindert, dass versehentlich eine Kante aus einer anderen
+            # Flaeche ueber eine unpassende Kombination selektiert wird.
+            edge_id = _get_geometry_id(edge, "edge")
+            valid = any(
+                _get_geometry_id(face.Edges.Item(i), "edge") == edge_id
+                for i in range(1, face.Edges.Count + 1)
+            )
+            if not valid:
+                raise ValueError(f"Kante '{edge_ref}' gehoert nicht zu Flaeche '{face_ref}'.")
+            coll.Add(edge)
+            continue
+
         if ":" not in part:
             raise ValueError(
-                f"Ungueltiges Format '{part}'. Erwartet 'F<idx>:E<idx>' "
-                "oder 'top'/'bottom'/'vertical'/'all'."
+                f"Ungueltiges Format '{part}'. Erwartet 'face_id/edge_id' "
+                "oder legacy 'F<idx>:E<idx>'."
             )
         face_str, edge_str = part.split(":", 1)
-        face_idx = int(face_str.upper().replace("F", ""))
-        edge_idx = int(edge_str.upper().replace("E", ""))
-
-        if face_idx < 1 or face_idx > body.Faces.Count:
-            raise ValueError(f"Flaechen-Index {face_idx} ungueltig.")
-        face = body.Faces.Item(face_idx)
-        if edge_idx < 1 or edge_idx > face.Edges.Count:
-            raise ValueError(
-                f"Kanten-Index {edge_idx} auf Flaeche {face_idx} ungueltig."
-            )
-        coll.Add(face.Edges.Item(edge_idx))
+        face_ref = face_str.strip()
+        edge_ref = edge_str.strip()
+        if face_ref.upper().startswith("F"):
+            face_ref = face_ref[1:]
+        if edge_ref.upper().startswith("E"):
+            edge_ref = edge_ref[1:]
+        face, _ = _resolve_face_reference(body, face_ref)
+        if edge_ref.isdigit():
+            edge_idx = int(edge_ref)
+            if edge_idx < 1 or edge_idx > face.Edges.Count:
+                raise ValueError(f"Kanten-Index {edge_idx} auf Flaeche ungueltig.")
+            coll.Add(face.Edges.Item(edge_idx))
+        else:
+            edge, _ = _resolve_edge_reference(body, edge_ref)
+            coll.Add(edge)
 
     if coll.Count == 0:
         raise RuntimeError("Keine Kanten aus der Angabe extrahiert.")

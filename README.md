@@ -56,11 +56,12 @@ The Inventor server connects an MCP-compatible AI assistant to a running Autodes
 
 ### Features
 
-- Create parts, boxes, cylinders, revolved profiles, sweeps, lofts, slots, and 3D paths
+- Create parts, boxes, cylinders, generic sketches, sketch extrusions, revolved profiles, sweeps, lofts, slots, and 3D paths
 - Add cuts, holes, counterbores, countersinks, chamfers, shells, drafts, and threads
 - Mirror bodies and features, and create rectangular or circular patterns
 - Read and modify model parameters
 - Inspect bodies, faces, edges, features, bounding boxes, mass properties, and iProperties
+- Address faces and edges with persistent `geometry_id` handles instead of relying on changing collection indices
 - Create assemblies, place components, and list occurrences
 - Create drawings and export STEP, STL, DXF, and DWG files
 - Save model screenshots from predefined camera orientations
@@ -102,6 +103,19 @@ Create a 100 × 60 × 20 mm box and add a 10 mm through-hole in its centre.
 ```text
 Show me the model's bounding box and mass properties, then export it as STEP.
 ```
+
+Generic sketch example:
+
+```text
+Create a sketch named "Base" on XY with a 40 x 20 mm rectangle and a 6 mm
+circle at (20, 10), then extrude the closed profile by 12 mm as a new body.
+```
+
+`create_sketch` accepts `line`, `circle`, `rectangle`, `polyline`, and
+`polygon` geometry. `list_faces` and `list_face_edges` return persistent
+`geometry_id` values. Use `face_id/edge_id` with `add_fillet` or
+`change_fillet_edges`; numeric `F1:E1` references remain available for older
+workflows.
 
 > [!NOTE]
 > Inventor COM automation is not thread-safe. The server intentionally performs one operation per tool call on a single thread.
