@@ -127,6 +127,7 @@ The Moodle server signs in through Moodle's regular login page and keeps an auth
 ### Features
 
 - Log in through a local GUI or terminal setup
+- Diagnose Moodle version, active theme, permissions, course-list source, and compatibility warnings
 - List and search courses with pagination for accounts with many enrolments
 - Inspect course sections and activities
 - Create courses
@@ -183,6 +184,10 @@ The `moodle_login` MCP tool can open a local Tkinter login window. `moodle_login
 
 ```text
 List my Moodle courses and show the sections in course 42.
+```
+
+```text
+Run moodle_diagnose and explain why my course list may be incomplete.
 ```
 
 ```text

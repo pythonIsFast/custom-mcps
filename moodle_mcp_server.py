@@ -1086,6 +1086,146 @@ class MoodleSession:
             "ids": [int(cmid)], "targetsectionid": int(target_section_id),
         })
 
+    def diagnose(self):
+        """Fuehrt ausschliesslich lesende Kompatibilitaets-Checks aus."""
+        warnings = []
+        pages = {}
+        version = None
+        theme = None
+
+        def inspect_page(label, path):
+            nonlocal version, theme
+            try:
+                response = self.s.get(f"{self.base}{path}", timeout=30)
+                soup = BeautifulSoup(response.text, "html.parser")
+                if version is None:
+                    match = re.search(
+                        r"\bMoodle\s+([0-9]+(?:\.[0-9]+){1,2})",
+                        response.text,
+                        flags=re.IGNORECASE,
+                    )
+                    if match:
+                        version = match.group(1)
+                if theme is None:
+                    body = soup.find("body")
+                    classes = body.get("class", []) if body else []
+                    for cls in classes:
+                        if str(cls).startswith("theme_"):
+                            theme = str(cls)[len("theme_"):]
+                            break
+                    if theme is None:
+                        theme_match = re.search(
+                            r"data-theme=[\"']([^\"']+)[\"']",
+                            response.text,
+                            flags=re.IGNORECASE,
+                        )
+                        if theme_match:
+                            theme = theme_match.group(1)
+                final_path = response.url.split("?", 1)[0].replace(self.base, "")
+                redirected_to_login = "/login/" in final_path
+                if redirected_to_login:
+                    access = "login_required"
+                elif response.status_code == 403:
+                    access = "forbidden"
+                elif response.status_code == 404:
+                    access = "not_found"
+                elif response.ok:
+                    access = "ok"
+                else:
+                    access = f"http_{response.status_code}"
+                pages[label] = {
+                    "status_code": response.status_code,
+                    "zugriff": access,
+                    "ziel": final_path or "/",
+                    "seitentitel": (
+                        soup.title.get_text(" ", strip=True)
+                        if soup.title else "?"
+                    ),
+                }
+            except requests.RequestException as exc:
+                pages[label] = {"zugriff": "fehler", "fehler": str(exc)}
+
+        # Diese GETs sind read-only und decken sowohl normale Nutzer- als
+        # auch typische Dozenten-/Admin-Seiten ab.
+        for label, path in (
+            ("dashboard", "/my/"),
+            ("meine_kurse", "/my/courses.php"),
+            ("kurskatalog", "/course/index.php"),
+            ("nutzerverwaltung", "/user/index.php"),
+            ("administration", "/admin/index.php"),
+        ):
+            inspect_page(label, path)
+
+        try:
+            course_result = self.list_courses(limit=100, offset=0)
+            courses = course_result.get("kurse", [])
+            course_list = {
+                "quelle": course_result.get("quelle"),
+                "anzahl_erste_seite": len(courses),
+                "weitere_vorhanden": course_result.get("weitere_vorhanden"),
+                "naechster_offset": course_result.get("naechster_offset"),
+                "beispiel_ids": [c.get("id") for c in courses[:5]],
+            }
+            if "HTML" in str(course_result.get("quelle", "")):
+                warnings.append(
+                    "Die Kursliste nutzt den HTML-Fallback. Bei dynamischen "
+                    "Themes kann sie unvollstaendig sein."
+                )
+            if course_result.get("weitere_vorhanden"):
+                warnings.append(
+                    "Mehr als 100 Kurse vorhanden; weitere Seiten muessen "
+                    "ueber offset geladen werden."
+                )
+        except Exception as exc:
+            course_list = {"zugriff": "fehler", "fehler": str(exc)}
+            warnings.append("Die Kursliste konnte nicht gelesen werden.")
+
+        course_state = {"getestet": False}
+        try:
+            first_id = course_list.get("beispiel_ids", [None])[0]
+            if first_id is not None:
+                state = self.course_state(first_id)
+                course_state = {
+                    "getestet": True,
+                    "zugriff": "ok" if isinstance(state, (dict, list)) else "antwort",
+                }
+        except Exception as exc:
+            course_state = {"getestet": True, "zugriff": "fehler", "fehler": str(exc)}
+            warnings.append(
+                "Die Kursstruktur ueber core_courseformat_get_state ist nicht "
+                "verfuegbar; der MCP muss HTML parsen."
+            )
+
+        if version is None:
+            warnings.append("Die Moodle-Version konnte nicht aus dem HTML erkannt werden.")
+        if theme is None:
+            warnings.append("Das aktive Theme konnte nicht erkannt werden.")
+        if not self.s.verify:
+            warnings.append("TLS-Zertifikatspruefung ist deaktiviert (verify_tls=False).")
+        if not _HAS_KEYRING:
+            warnings.append(
+                "Kein OS-Keyring verfuegbar; Passwoerter koennen lokal in "
+                "config.json gespeichert werden."
+            )
+        if pages.get("administration", {}).get("zugriff") == "forbidden":
+            warnings.append("Administrationsseiten sind fuer diesen Benutzer gesperrt.")
+
+        return {
+            "status": "ok" if not any(
+                value.get("zugriff") == "fehler"
+                for value in pages.values()
+                if isinstance(value, dict)
+            ) else "teilweise",
+            "url": self.base,
+            "moodle_version": version,
+            "theme": theme,
+            "benutzer": {"userid": self.userid, "angemeldet": bool(self.sesskey)},
+            "kursliste": course_list,
+            "kursstruktur": course_state,
+            "seitenzugriff": pages,
+            "warnungen": warnings,
+        }
+
     def whoami(self):
         r = self.s.get(f"{self.base}/my/", timeout=30)
         soup = BeautifulSoup(r.text, "html.parser")
@@ -1248,6 +1388,28 @@ def moodle_status() -> dict:
     except Exception as e:
         return {"angemeldet": False, "fehler": str(e),
                 "credential_quelle": creds.get("quelle")}
+
+
+@mcp.tool()
+def moodle_diagnose() -> dict:
+    """Prueft Moodle-Version, Theme, Kursliste und typische Zugriffe.
+
+    Das Werkzeug fuehrt nur lesende GET- und AJAX-Anfragen aus. Es veraendert
+    keine Kurse, Aktivitaeten oder Nutzer. Die Ausgabe hilft besonders dabei,
+    Probleme mit grossen Kurslisten, Themes, Moodle-Versionen und fehlenden
+    Berechtigungen einzugrenzen.
+    """
+    try:
+        return with_retry(lambda s: s.diagnose())
+    except Exception as exc:
+        return {
+            "status": "fehlgeschlagen",
+            "fehler": str(exc),
+            "hinweis": (
+                "Bitte zuerst moodle_login ausfuehren. Bei SSO oder 2FA "
+                "kann der normale Passwort-Login nicht funktionieren."
+            ),
+        }
 
 
 @mcp.tool()
