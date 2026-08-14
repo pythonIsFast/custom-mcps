@@ -4,7 +4,7 @@ import unittest
 from hashlib import sha256
 from pathlib import Path
 
-from installer_manager import ManagerApi
+from installer_manager import ManagerApi, SERVERS, server_asset
 
 
 class InstallerManagerConfigTests(unittest.TestCase):
@@ -100,7 +100,7 @@ class InstallerManagerConfigTests(unittest.TestCase):
         self.assertIn('model = "example"', text)
         self.assertIn("[mcp_servers.existing]", text)
         self.assertIn("[mcp_servers.custom_moodle]", text)
-        self.assertIn("moodle-mcp-server-linux-x64", text)
+        self.assertIn(server_asset(SERVERS["moodle"]), text)
 
     def test_invalid_json_is_never_overwritten(self):
         path = self.home / ".cursor" / "mcp.json"
@@ -226,7 +226,8 @@ class InstallerManagerConfigTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertEqual(self.api.install_dir, new_install.resolve())
-        for name in ("inventor-mcp-server.exe", "moodle-mcp-server-linux-x64"):
+        for server_id in ("inventor", "moodle"):
+            name = server_asset(SERVERS[server_id])
             self.assertTrue((new_install / "bin" / name).exists())
             self.assertFalse((self.install / "bin" / name).exists())
         settings = json.loads(self.api.settings_path.read_text(encoding="utf-8"))
