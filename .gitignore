@@ -13,6 +13,9 @@ dist/
 .env.*
 !.env.example
 
+# Local Proxmox MCP credentials
+.proxmox_mcp/
+
 .idea/
 .vscode/
 .DS_Store

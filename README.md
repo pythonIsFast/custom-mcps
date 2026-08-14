@@ -2,7 +2,7 @@
 
 [![Build and release MCP executables](https://github.com/pythonIsFast/custom-mcps/actions/workflows/build-inventor-exe.yml/badge.svg)](https://github.com/pythonIsFast/custom-mcps/actions/workflows/build-inventor-exe.yml)
 
-Two local Model Context Protocol servers for controlling **Autodesk Inventor** and managing **Moodle without Web Service tokens**. Build CAD models through Inventor's COM API or work with Moodle courses through an authenticated browser-style session.
+Three local Model Context Protocol servers for controlling **Autodesk Inventor**, managing **Moodle without Web Service tokens**, and operating **Proxmox VE** through its native API. Build CAD models through Inventor's COM API, work with Moodle courses through an authenticated browser-style session, or manage a Proxmox cluster with a scoped API token.
 
 > [!IMPORTANT]
 > This repository is experimental. Test write and delete operations on disposable Inventor documents and Moodle courses before using them with important data.
@@ -13,7 +13,8 @@ Two local Model Context Protocol servers for controlling **Autodesk Inventor** a
 | --- | --- | --- |
 | [`inventor_mcp_server.py`](./inventor_mcp_server.py) | Controls Autodesk Inventor through its COM API | Windows |
 | [`moodle_mcp_server.py`](./moodle_mcp_server.py) | Manages Moodle through a normal login session, internal AJAX calls, and HTML forms | Windows, Linux, WSL |
-| [`installer_manager.py`](./installer_manager.py) | Installs release builds and configures supported MCP clients through a local HTML UI | Windows |
+| [`proxmox_mcp_server.py`](./proxmox_mcp_server.py) | Exposes the complete Proxmox VE JSON API through a secure generic MCP interface | Windows, Linux, WSL |
+| [`installer_manager.py`](./installer_manager.py) | Installs release builds and configures supported MCP clients through a local HTML UI | Windows, Linux |
 
 ## 🚀 Custom MCP Manager
 
@@ -33,11 +34,12 @@ application built with an HTML interface and a Python bridge.
 - Preserves unrelated client settings
 - Creates and restores timestamped configuration backups
 - Creates Desktop and Start Menu shortcuts
-- Opens Moodle's secure terminal login setup
+- Opens secure terminal setup for Moodle and Proxmox VE
 - Keeps an in-app activity log for troubleshooting
 
-Download `custom-mcp-manager.exe` from the latest release and run it. No Python
-installation is required for the prebuilt manager.
+Download `custom-mcp-manager.exe` on Windows or
+`custom-mcp-manager-linux-x64` on Linux from the latest release and run it. No
+Python installation is required for either prebuilt manager.
 
 To run it from source:
 
@@ -204,9 +206,81 @@ Add a page named "Welcome" to section 1 with a short introduction.
 > [!CAUTION]
 > Generic AJAX and form tools are powerful and can change or delete Moodle data. Use a dedicated Moodle account with the minimum required permissions and test against a non-production course first.
 
+## 🖥️ Proxmox VE MCP
+
+The Proxmox VE server exposes the live JSON API behind a small set of MCP
+tools. `pve_request` can call every HTTP endpoint available to the configured
+API token, so the MCP does not become stale when Proxmox adds an endpoint. Use
+`pve_api_schema` to inspect paths and accepted parameters directly on the
+connected PVE instance.
+
+### Features
+
+- Call every Proxmox VE JSON API endpoint with `pve_request`
+- Inspect the live API tree and endpoint parameter schemas
+- Upload files through multipart API endpoints
+- List cluster resources and guests with concise convenience tools
+- Start, stop, reboot, suspend, and resume QEMU VMs and LXC containers
+- Read and wait for asynchronous Proxmox tasks (UPIDs)
+- Diagnose connectivity, PVE version, and the configured token identity
+
+### Requirements
+
+- Python 3.10 or newer
+- `fastmcp>=3,<4`
+- `requests`
+- Network access to the Proxmox VE API (usually HTTPS port 8006)
+- A Proxmox VE API token with deliberately scoped ACLs
+
+### Installation and authentication
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install "fastmcp>=3,<4" requests
+```
+
+Create a dedicated PVE user and API token in the Proxmox UI, then grant it
+only the ACLs required for the tasks it should perform. Export its values in
+the environment used by your MCP client:
+
+```bash
+export PVE_URL="https://pve.example:8006"
+export PVE_TOKEN_ID="automation@pve!mcp"
+export PVE_TOKEN_SECRET="replace-with-the-token-secret"
+export PVE_VERIFY_TLS=1
+python proxmox_mcp_server.py
+```
+
+Run `python proxmox_mcp_server.py --setup` to validate a URL and token
+interactively. It stores them in `~/.proxmox_mcp/config.json` with mode `0600`,
+so Claude can start the MCP reliably without depending on a desktop keyring or
+session service. Environment variables always override saved credentials.
+`PVE_VERIFY_TLS` defaults to `1`; only set it to `0` temporarily when
+connecting to a deliberately trusted host with a self-signed certificate.
+
+### Safe operation
+
+Read-only API requests are available immediately. Every request with a
+state-changing HTTP method (`POST`, `PUT`, `PATCH`, or `DELETE`) requires
+`confirm=true`; uploads do too. This is an MCP-level guard, not a replacement
+for Proxmox permissions. The API token's ACLs remain the authoritative limit.
+
+```text
+Use pve_api_schema for /nodes/pve1/qemu/100, then show the VM configuration.
+```
+
+```text
+Start VM 100 on pve1 using pve_guest_action with confirm=true, wait for its task, then show its status.
+```
+
+```text
+Use pve_request to create a snapshot for container 200. Inspect the endpoint schema first and ask me for confirmation before sending the request.
+```
+
 ## 🔌 MCP client configuration
 
-Add one or both servers to your MCP client's configuration. Replace the example paths with absolute paths on your machine.
+Add the servers you need to your MCP client's configuration. Replace the example paths with absolute paths on your machine.
 
 ```json
 {
@@ -222,6 +296,17 @@ Add one or both servers to your MCP client's configuration. Replace the example 
       "args": [
         "C:/path/to/CustomMCPs/moodle_mcp_server.py"
       ]
+    },
+    "proxmox": {
+      "command": "C:/path/to/CustomMCPs/.venv/Scripts/python.exe",
+      "args": [
+        "C:/path/to/CustomMCPs/proxmox_mcp_server.py"
+      ],
+      "env": {
+        "PVE_URL": "https://pve.example:8006",
+        "PVE_TOKEN_ID": "automation@pve!mcp",
+        "PVE_TOKEN_SECRET": "replace-with-your-token-secret"
+      }
     }
   }
 }
@@ -249,15 +334,18 @@ The executable will be created in the `dist` directory.
 
 ### Download prebuilt executables
 
-Whenever `inventor_mcp_server.py` or `moodle_mcp_server.py` changes on `main`,
-or when the installer manager changes, GitHub Actions builds Windows x64
-executables for all components plus a Linux x64 executable for Moodle, then
+Whenever a server source file changes on `main`, or when the installer manager
+changes, GitHub Actions builds Windows x64 executables for all components plus
+Linux x64 executables for Moodle and Proxmox VE, then
 creates a new GitHub Release:
 
 - `inventor-mcp-server.exe`
 - `moodle-mcp-server.exe`
+- `proxmox-mcp-server.exe`
 - `custom-mcp-manager.exe`
+- `custom-mcp-manager-linux-x64`
 - `moodle-mcp-server-linux-x64`
+- `proxmox-mcp-server-linux-x64`
 - `SHA256SUMS.txt`
 
 Download them from the repository's **Releases** page. Releases use semantic

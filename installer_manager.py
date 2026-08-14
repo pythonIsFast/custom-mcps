@@ -48,15 +48,37 @@ SERVERS = {
         "name": "Autodesk Inventor MCP",
         "description": "Create and inspect CAD models through Inventor COM automation.",
         "asset": "inventor-mcp-server.exe",
+        "linux_asset": None,
         "config_name": "custom_inventor",
     },
     "moodle": {
         "name": "Moodle MCP",
         "description": "Manage Moodle through a normal authenticated browser session.",
         "asset": "moodle-mcp-server.exe",
+        "linux_asset": "moodle-mcp-server-linux-x64",
         "config_name": "custom_moodle",
     },
+    "proxmox": {
+        "name": "Proxmox VE MCP",
+        "description": "Manage a Proxmox VE cluster through a scoped API token.",
+        "asset": "proxmox-mcp-server.exe",
+        "linux_asset": "proxmox-mcp-server-linux-x64",
+        "config_name": "custom_proxmox",
+    },
 }
+
+
+def server_asset(spec: dict[str, Any]) -> str:
+    """Return the release asset appropriate for the operating system."""
+    linux_asset = spec.get("linux_asset")
+    if sys.platform.startswith("linux") and linux_asset:
+        return str(linux_asset)
+    return str(spec["asset"])
+
+
+def server_supported(spec: dict[str, Any]) -> bool:
+    """Whether the current platform has a release artifact for this server."""
+    return not sys.platform.startswith("linux") or bool(spec.get("linux_asset"))
 
 
 def resource_path(*parts: str) -> Path:
@@ -201,11 +223,12 @@ class ManagerApi:
         metadata = self._load_metadata()
         servers = {}
         for server_id, spec in SERVERS.items():
-            path = self.bin_dir / spec["asset"]
+            asset_name = server_asset(spec)
+            path = self.bin_dir / asset_name
             installed = path.exists()
             local_digest = sha256_file(path) if installed else None
             release_asset = (self._release or {}).get("assets", {}).get(
-                spec["asset"], {}
+                asset_name, {}
             )
             available_digest = self._digest_value(release_asset.get("digest"))
             installed_tag = metadata.get(server_id, {}).get("release_tag")
@@ -229,6 +252,7 @@ class ManagerApi:
             servers[server_id] = {
                 **spec,
                 "id": server_id,
+                "supported": server_supported(spec),
                 "installed": installed,
                 "path": str(path),
                 "size": path.stat().st_size if installed else 0,
@@ -286,6 +310,8 @@ class ManagerApi:
     def install_server(self, server_id: str) -> dict[str, Any]:
         if server_id not in SERVERS:
             return {"ok": False, "error": f"Unknown server: {server_id}"}
+        if not server_supported(SERVERS[server_id]):
+            return {"ok": False, "error": f"{SERVERS[server_id]['name']} is not available on Linux."}
         if not self._operation_lock.acquire(blocking=False):
             return {"ok": False, "error": "Another installation is already running."}
         try:
@@ -299,6 +325,9 @@ class ManagerApi:
         try:
             results = {}
             for server_id in SERVERS:
+                if not server_supported(SERVERS[server_id]):
+                    results[server_id] = {"ok": True, "status": "unsupported"}
+                    continue
                 result = self._install_server_locked(server_id)
                 results[server_id] = result
                 if not result.get("ok"):
@@ -318,7 +347,7 @@ class ManagerApi:
             return {"ok": False, "error": "Another installation is already running."}
         try:
             spec = SERVERS[server_id]
-            target = self.bin_dir / spec["asset"]
+            target = self.bin_dir / server_asset(spec)
             try:
                 target.unlink(missing_ok=True)
             except PermissionError:
@@ -349,17 +378,18 @@ class ManagerApi:
                 return release_result
 
         assert self._release is not None
-        asset = self._release["assets"].get(spec["asset"])
+        asset_name = server_asset(spec)
+        asset = self._release["assets"].get(asset_name)
         if not asset or not asset.get("download_url"):
             message = (
-                f"{spec['asset']} is missing from release "
+                f"{asset_name} is missing from release "
                 f"{self._release.get('tag') or '(unknown)'}."
             )
             self._log(message, "error")
             return {"ok": False, "error": message}
 
         self.bin_dir.mkdir(parents=True, exist_ok=True)
-        target = self.bin_dir / spec["asset"]
+        target = self.bin_dir / asset_name
         expected_digest = self._digest_value(asset.get("digest"))
 
         if target.exists() and expected_digest:
@@ -386,9 +416,9 @@ class ManagerApi:
                 "progress",
                 server=server_id,
                 percent=0,
-                status=f"Downloading {spec['asset']}",
+                status=f"Downloading {asset_name}",
             )
-            self._log(f"Downloading {spec['asset']}...")
+            self._log(f"Downloading {asset_name}...")
             digest = hashlib.sha256()
             downloaded = 0
 
@@ -409,7 +439,7 @@ class ManagerApi:
                             "progress",
                             server=server_id,
                             percent=min(percent, 99),
-                            status=f"Downloading {spec['asset']}",
+                            status=f"Downloading {asset_name}",
                             downloaded=downloaded,
                             total=total,
                         )
@@ -519,7 +549,7 @@ class ManagerApi:
             }
 
         for server_id in server_ids:
-            target = self.bin_dir / SERVERS[server_id]["asset"]
+            target = self.bin_dir / server_asset(SERVERS[server_id])
             if not target.exists():
                 return {
                     "ok": False,
@@ -752,7 +782,7 @@ class ManagerApi:
         for server_id in server_ids:
             spec = SERVERS[server_id]
             item = {
-                "command": str(self.bin_dir / spec["asset"]),
+                "command": str(self.bin_dir / server_asset(spec)),
                 "args": [],
             }
             if client_id == "vscode":
@@ -786,7 +816,7 @@ class ManagerApi:
                 rf"(?ms)^\[{re.escape(section)}\][^\n]*\n.*?(?=^\[|\Z)"
             )
             text = pattern.sub("", text).rstrip()
-            command = json.dumps(str(self.bin_dir / spec["asset"]))
+            command = json.dumps(str(self.bin_dir / server_asset(spec)))
             block = f"[{section}]\ncommand = {command}\nargs = []"
             text = f"{text}\n\n{block}\n" if text else f"{block}\n"
 
@@ -983,10 +1013,10 @@ class ManagerApi:
             moved = []
             if move_existing:
                 for spec in SERVERS.values():
-                    source = old_bin_dir / spec["asset"]
+                    source = old_bin_dir / server_asset(spec)
                     if not source.exists():
                         continue
-                    destination = new_bin_dir / spec["asset"]
+                    destination = new_bin_dir / server_asset(spec)
                     if destination.exists() and sha256_file(destination) != sha256_file(source):
                         return {
                             "ok": False,
@@ -1024,7 +1054,7 @@ class ManagerApi:
             )
             metadata = self._load_metadata()
             for server_id, spec in SERVERS.items():
-                target = self.bin_dir / spec["asset"]
+                target = self.bin_dir / server_asset(spec)
                 if target.exists() and server_id in metadata:
                     metadata[server_id]["path"] = str(target)
             self._save_metadata(metadata)
@@ -1110,9 +1140,24 @@ class ManagerApi:
             return {"ok": False, "error": str(exc)}
 
     def run_moodle_setup(self) -> dict[str, Any]:
-        executable = self.bin_dir / SERVERS["moodle"]["asset"]
+        executable = self.bin_dir / server_asset(SERVERS["moodle"])
         if not executable.exists():
             return {"ok": False, "error": "Install Moodle MCP first."}
+        try:
+            subprocess.Popen(
+                [str(executable), "--setup"],
+                creationflags=(
+                    subprocess.CREATE_NEW_CONSOLE if sys.platform == "win32" else 0
+                ),
+            )
+            return {"ok": True}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def run_proxmox_setup(self) -> dict[str, Any]:
+        executable = self.bin_dir / server_asset(SERVERS["proxmox"])
+        if not executable.exists():
+            return {"ok": False, "error": "Install Proxmox VE MCP first."}
         try:
             subprocess.Popen(
                 [str(executable), "--setup"],

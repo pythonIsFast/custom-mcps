@@ -9,6 +9,8 @@ on:
     paths:
       - inventor_mcp_server.py
       - moodle_mcp_server.py
+      - proxmox_mcp_server.py
+      - proxmox_client.py
       - installer_manager.py
       - installer_ui/**
       - tests/**
@@ -50,7 +52,7 @@ jobs:
       - name: Validate sources
         shell: pwsh
         run: |
-          python -m py_compile inventor_mcp_server.py moodle_mcp_server.py installer_manager.py
+          python -m py_compile inventor_mcp_server.py moodle_mcp_server.py proxmox_client.py proxmox_mcp_server.py installer_manager.py
           python -m unittest discover -s tests -v
 
       - name: Build Inventor executable
@@ -77,6 +79,18 @@ jobs:
             --collect-submodules keyring.backends `
             moodle_mcp_server.py
 
+      - name: Build Proxmox VE executable
+        shell: pwsh
+        run: |
+          pyinstaller `
+            --clean `
+            --noconfirm `
+            --onefile `
+            --name proxmox-mcp-server `
+            --copy-metadata fastmcp `
+            --copy-metadata fastmcp-slim `
+            proxmox_mcp_server.py
+
       - name: Build installer manager
         shell: pwsh
         run: |
@@ -98,6 +112,7 @@ jobs:
           $artifacts = @(
             "dist/inventor-mcp-server.exe",
             "dist/moodle-mcp-server.exe",
+            "dist/proxmox-mcp-server.exe",
             "dist/custom-mcp-manager.exe"
           )
           foreach ($path in $artifacts) {
@@ -113,12 +128,13 @@ jobs:
           path: |
             dist/inventor-mcp-server.exe
             dist/moodle-mcp-server.exe
+            dist/proxmox-mcp-server.exe
             dist/custom-mcp-manager.exe
           if-no-files-found: error
           retention-days: 30
 
-  build-linux-moodle:
-    name: Build Linux Moodle executable
+  build-linux-servers:
+    name: Build Linux MCP executables
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -135,17 +151,17 @@ jobs:
       - name: Install OS dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3-tk
+          sudo apt-get install -y python3-tk libgtk-3-dev gir1.2-webkit2-4.1
 
       - name: Install build dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install "mcp[cli]" "fastmcp>=3,<4" requests beautifulsoup4 keyring pyinstaller
+          python -m pip install "mcp[cli]" "fastmcp>=3,<4" requests beautifulsoup4 keyring pyinstaller "pywebview>=5.4,<7"
 
-      - name: Validate Moodle source
+      - name: Validate Linux MCP sources
         run: |
-          python -m py_compile moodle_mcp_server.py
-          python -m unittest discover -s tests -p "test_moodle_courses.py" -v
+          python -m py_compile moodle_mcp_server.py proxmox_client.py proxmox_mcp_server.py
+          python -m unittest discover -s tests -v
 
       - name: Build Linux Moodle executable
         run: |
@@ -158,16 +174,41 @@ jobs:
             --collect-submodules keyring.backends \
             moodle_mcp_server.py
 
+      - name: Build Linux Proxmox VE executable
+        run: |
+          pyinstaller \
+            --clean \
+            --noconfirm \
+            --onefile \
+            --name proxmox-mcp-server-linux-x64 \
+            --copy-metadata fastmcp \
+            --copy-metadata fastmcp-slim \
+            proxmox_mcp_server.py
+
+      - name: Build Linux manager executable
+        run: |
+          pyinstaller \
+            --clean \
+            --noconfirm \
+            --onefile \
+            --name custom-mcp-manager-linux-x64 \
+            --add-data "installer_ui:installer_ui" \
+            --collect-all webview \
+            installer_manager.py
+
       - name: Verify Linux executable
         run: |
-          ls -lh dist/moodle-mcp-server-linux-x64
-          sha256sum dist/moodle-mcp-server-linux-x64
+          ls -lh dist/moodle-mcp-server-linux-x64 dist/proxmox-mcp-server-linux-x64 dist/custom-mcp-manager-linux-x64
+          sha256sum dist/moodle-mcp-server-linux-x64 dist/proxmox-mcp-server-linux-x64 dist/custom-mcp-manager-linux-x64
 
       - name: Upload Linux Moodle artifact
         uses: actions/upload-artifact@v4
         with:
-          name: moodle-mcp-server-linux-x64
-          path: dist/moodle-mcp-server-linux-x64
+          name: custom-mcp-servers-linux-x64
+          path: |
+            dist/moodle-mcp-server-linux-x64
+            dist/proxmox-mcp-server-linux-x64
+            dist/custom-mcp-manager-linux-x64
           if-no-files-found: error
           retention-days: 30
 
@@ -177,7 +218,7 @@ jobs:
     timeout-minutes: 20
     needs:
       - build-windows
-      - build-linux-moodle
+      - build-linux-servers
 
     steps:
       - name: Check out repository
@@ -194,7 +235,7 @@ jobs:
       - name: Download Linux Moodle artifact
         uses: actions/download-artifact@v4
         with:
-          name: moodle-mcp-server-linux-x64
+          name: custom-mcp-servers-linux-x64
           path: dist
 
       - name: Verify release assets
@@ -288,7 +329,10 @@ jobs:
           | **custom-mcp-manager.exe** | Recommended installer and client configuration UI |
           | **inventor-mcp-server.exe** | Autodesk Inventor MCP server |
           | **moodle-mcp-server.exe** | Moodle MCP server |
+          | **proxmox-mcp-server.exe** | Proxmox VE MCP server |
           | **moodle-mcp-server-linux-x64** | Moodle MCP server for Linux x64 |
+          | **proxmox-mcp-server-linux-x64** | Proxmox VE MCP server for Linux x64 |
+          | **custom-mcp-manager-linux-x64** | Custom MCP Manager for Linux x64 |
           | **SHA256SUMS.txt** | SHA-256 checksums for all release assets |
 
           ## 🔐 Verify your download
@@ -312,8 +356,11 @@ jobs:
           gh release create $tag `
             "dist/inventor-mcp-server.exe" `
             "dist/moodle-mcp-server.exe" `
+            "dist/proxmox-mcp-server.exe" `
             "dist/custom-mcp-manager.exe" `
             "dist/moodle-mcp-server-linux-x64" `
+            "dist/proxmox-mcp-server-linux-x64" `
+            "dist/custom-mcp-manager-linux-x64" `
             "dist/SHA256SUMS.txt" `
             --target $env:GITHUB_SHA `
             --title $title `

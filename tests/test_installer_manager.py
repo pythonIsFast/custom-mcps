@@ -25,6 +25,9 @@ class InstallerManagerConfigTests(unittest.TestCase):
         for spec in (
             "inventor-mcp-server.exe",
             "moodle-mcp-server.exe",
+            "proxmox-mcp-server.exe",
+            "moodle-mcp-server-linux-x64",
+            "proxmox-mcp-server-linux-x64",
         ):
             (self.api.bin_dir / spec).write_bytes(b"test executable")
 
@@ -58,7 +61,7 @@ class InstallerManagerConfigTests(unittest.TestCase):
         self.assertTrue(Path(result["backups"][0]).exists())
 
     def test_vscode_uses_servers_root_and_stdio_type(self):
-        result = self.api.configure_clients(["vscode"], ["inventor"])
+        result = self.api.configure_clients(["vscode"], ["inventor", "proxmox"])
 
         self.assertTrue(result["ok"])
         path = self.appdata / "Code" / "User" / "mcp.json"
@@ -66,6 +69,7 @@ class InstallerManagerConfigTests(unittest.TestCase):
         server = data["servers"]["custom_inventor"]
         self.assertEqual(server["type"], "stdio")
         self.assertEqual(server["args"], [])
+        self.assertIn("custom_proxmox", data["servers"])
 
     def test_bridge_health_check_and_diagnostic_log(self):
         status = self.api.bridge_status()
@@ -96,7 +100,7 @@ class InstallerManagerConfigTests(unittest.TestCase):
         self.assertIn('model = "example"', text)
         self.assertIn("[mcp_servers.existing]", text)
         self.assertIn("[mcp_servers.custom_moodle]", text)
-        self.assertIn("moodle-mcp-server.exe", text)
+        self.assertIn("moodle-mcp-server-linux-x64", text)
 
     def test_invalid_json_is_never_overwritten(self):
         path = self.home / ".cursor" / "mcp.json"
@@ -203,6 +207,9 @@ class InstallerManagerConfigTests(unittest.TestCase):
                 "moodle-mcp-server.exe": {
                     "digest": "sha256:" + ("0" * 64)
                 },
+                "moodle-mcp-server-linux-x64": {
+                    "digest": "sha256:" + ("0" * 64)
+                },
             },
         }
 
@@ -219,7 +226,7 @@ class InstallerManagerConfigTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertEqual(self.api.install_dir, new_install.resolve())
-        for name in ("inventor-mcp-server.exe", "moodle-mcp-server.exe"):
+        for name in ("inventor-mcp-server.exe", "moodle-mcp-server-linux-x64"):
             self.assertTrue((new_install / "bin" / name).exists())
             self.assertFalse((self.install / "bin" / name).exists())
         settings = json.loads(self.api.settings_path.read_text(encoding="utf-8"))
