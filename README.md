@@ -58,8 +58,8 @@ The Inventor server connects an MCP-compatible AI assistant to a running Autodes
 
 ### Features
 
-- Create parts, boxes, cylinders, generic sketches, sketch extrusions, revolved profiles, sweeps, lofts, slots, and 3D paths
-- Add cuts, holes, counterbores, countersinks, chamfers, shells, drafts, and threads
+- Create parts, boxes, cylinders, generic sketches, sketch extrusions, revolved profiles, circular or rectangular sweeps, mixed-section lofts, slots, and 3D paths
+- Add cuts, holes, counterbores, countersinks, equal/two-distance/distance-angle chamfers, inside/outside/two-sided shells, drafts, and threads
 - Mirror bodies and features, and create rectangular or circular patterns
 - Read and modify model parameters
 - Inspect bodies, faces, edges, features, bounding boxes, mass properties, and iProperties
@@ -116,8 +116,32 @@ circle at (20, 10), then extrude the closed profile by 12 mm as a new body.
 `create_sketch` accepts `line`, `circle`, `rectangle`, `polyline`, and
 `polygon` geometry. `list_faces` and `list_face_edges` return persistent
 `geometry_id` values. Use `face_id/edge_id` with `add_fillet` or
-`change_fillet_edges`; numeric `F1:E1` references remain available for older
+`add_chamfer`; numeric `F1:E1` references remain available for older
 workflows.
+
+Advanced feature examples:
+
+```text
+Sweep a 12 mm circle along 0,0,0;40,0,0;40,30,20 with the profile normal
+to the path and a 30 degree twist.
+```
+
+```text
+Create a loft with sections "0|circle|50;30|rectangle|40|25;60|circle|20".
+```
+
+```text
+List the faces, then remove the selected top face and create a 2 mm shell
+directed inside.
+```
+
+The `loft` tool also retains its legacy circular syntax such as
+`XY:50;30:40;60:30`. Structured section syntax is
+`plane|circle|diameter[|centre_x|centre_y]` or
+`plane|rectangle|width|height[|centre_x|centre_y]`. The `shell` tool accepts
+stable face IDs from `list_faces`. `add_chamfer` supports `distance`,
+`two_distances`, and `distance_angle`; asymmetric chamfers can use a stable
+`reference_face` ID.
 
 > [!NOTE]
 > Inventor COM automation is not thread-safe. The server intentionally performs one operation per tool call on a single thread.

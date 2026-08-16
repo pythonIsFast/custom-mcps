@@ -78,6 +78,165 @@ def _mm_to_cm(value_mm: float) -> float:
     return value_mm / 10.0
 
 
+def _parse_feature_operation(operation: str):
+    """Return an Inventor operation enum and reject ambiguous input.
+
+    Older tools silently converted every misspelling to ``new``.  That is
+    dangerous for destructive operations such as a sweep cut, so the newer
+    feature tools share this strict parser.
+    """
+    normalized = str(operation).strip().lower()
+    operations = {
+        "new": _const.kNewBodyOperation,
+        "join": _const.kJoinOperation,
+        "cut": _const.kCutOperation,
+        "intersect": _const.kIntersectOperation,
+        "surface": _const.kSurfaceOperation,
+    }
+    if normalized not in operations:
+        raise ValueError(
+            f"Unknown operation '{operation}'. Allowed values: "
+            "new, join, cut, intersect, surface."
+        )
+    return operations[normalized]
+
+
+def _parse_3d_point_string(points: str, minimum: int = 2) -> list[tuple[float, float, float]]:
+    """Parse ``x,y,z;x,y,z`` millimetre coordinates and validate the path."""
+    parsed: list[tuple[float, float, float]] = []
+    for raw_point in (part.strip() for part in str(points).split(";")):
+        if not raw_point:
+            continue
+        coordinates = [value.strip() for value in raw_point.split(",")]
+        if len(coordinates) != 3:
+            raise ValueError(
+                f"Invalid 3D point '{raw_point}'. Expected 'x,y,z' in mm."
+            )
+        try:
+            point = tuple(float(value) for value in coordinates)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid 3D point '{raw_point}': coordinates must be numbers."
+            ) from exc
+        if not all(math.isfinite(value) for value in point):
+            raise ValueError(f"Invalid 3D point '{raw_point}': values must be finite.")
+        if parsed and all(
+            abs(point[index] - parsed[-1][index]) < 1e-9 for index in range(3)
+        ):
+            raise ValueError(
+                f"Consecutive path points must differ; '{raw_point}' is duplicated."
+            )
+        parsed.append(point)
+
+    if len(parsed) < minimum:
+        raise ValueError(f"At least {minimum} 3D points are required.")
+    return parsed
+
+
+def _normal_plane_axes(
+    start: tuple[float, float, float],
+    end: tuple[float, float, float],
+) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    """Build stable, right-handed X/Y axes for a plane normal to a segment."""
+    normal = tuple(end[index] - start[index] for index in range(3))
+    length = math.sqrt(sum(value * value for value in normal))
+    if length < 1e-12:
+        raise ValueError("The first sweep path segment has zero length.")
+    normal = tuple(value / length for value in normal)
+
+    # Choose a reference axis that is not almost parallel to the path.
+    reference = (0.0, 0.0, 1.0) if abs(normal[2]) < 0.9 else (0.0, 1.0, 0.0)
+    x_axis = (
+        reference[1] * normal[2] - reference[2] * normal[1],
+        reference[2] * normal[0] - reference[0] * normal[2],
+        reference[0] * normal[1] - reference[1] * normal[0],
+    )
+    x_length = math.sqrt(sum(value * value for value in x_axis))
+    x_axis = tuple(value / x_length for value in x_axis)
+    y_axis = (
+        normal[1] * x_axis[2] - normal[2] * x_axis[1],
+        normal[2] * x_axis[0] - normal[0] * x_axis[2],
+        normal[0] * x_axis[1] - normal[1] * x_axis[0],
+    )
+    return x_axis, y_axis
+
+
+def _parse_loft_sections(sections: str) -> list[dict]:
+    """Parse legacy circular and structured circle/rectangle loft sections.
+
+    Legacy format: ``plane:diameter`` (for example ``XY:50;30:40``).
+    Structured format uses pipes so offset planes remain unambiguous:
+    ``plane|circle|diameter|cx|cy`` or
+    ``plane|rectangle|width|height|cx|cy``.  Centres default to zero.
+    """
+    result: list[dict] = []
+    for raw_section in (part.strip() for part in str(sections).split(";")):
+        if not raw_section:
+            continue
+        if "|" not in raw_section:
+            legacy = [value.strip() for value in raw_section.split(":")]
+            if len(legacy) != 2:
+                raise ValueError(
+                    f"Invalid loft section '{raw_section}'. Expected "
+                    "'plane:diameter' or the structured pipe format."
+                )
+            plane, diameter = legacy
+            values = {
+                "plane": plane,
+                "shape": "circle",
+                "diameter_mm": float(diameter),
+                "center_x_mm": 0.0,
+                "center_y_mm": 0.0,
+            }
+        else:
+            fields = [value.strip() for value in raw_section.split("|")]
+            if len(fields) < 3:
+                raise ValueError(f"Invalid structured loft section '{raw_section}'.")
+            plane, shape = fields[0], fields[1].lower()
+            if shape == "circle" and len(fields) in (3, 5):
+                values = {
+                    "plane": plane,
+                    "shape": shape,
+                    "diameter_mm": float(fields[2]),
+                    "center_x_mm": float(fields[3]) if len(fields) == 5 else 0.0,
+                    "center_y_mm": float(fields[4]) if len(fields) == 5 else 0.0,
+                }
+            elif shape in ("rectangle", "rect") and len(fields) in (4, 6):
+                values = {
+                    "plane": plane,
+                    "shape": "rectangle",
+                    "width_mm": float(fields[2]),
+                    "height_mm": float(fields[3]),
+                    "center_x_mm": float(fields[4]) if len(fields) == 6 else 0.0,
+                    "center_y_mm": float(fields[5]) if len(fields) == 6 else 0.0,
+                }
+            else:
+                raise ValueError(
+                    f"Invalid loft section '{raw_section}'. Use "
+                    "plane|circle|diameter[|cx|cy] or "
+                    "plane|rectangle|width|height[|cx|cy]."
+                )
+
+        dimensions = [
+            value for key, value in values.items()
+            if key in ("diameter_mm", "width_mm", "height_mm")
+        ]
+        if not values["plane"]:
+            raise ValueError("Every loft section needs a plane.")
+        if not all(math.isfinite(float(value)) and float(value) > 0 for value in dimensions):
+            raise ValueError(f"Loft section dimensions must be finite and greater than zero: '{raw_section}'.")
+        if not all(
+            math.isfinite(float(values[key]))
+            for key in ("center_x_mm", "center_y_mm")
+        ):
+            raise ValueError(f"Loft section centres must be finite: '{raw_section}'.")
+        result.append(values)
+
+    if len(result) < 2:
+        raise ValueError("At least two loft sections are required.")
+    return result
+
+
 def _detect_cut_direction(comp_def):
     """
     Erkennt die Richtung des ersten Volumenkoerpers anhand der Bounding-Box
@@ -687,6 +846,47 @@ def _resolve_edge_reference(body, reference: str):
     if edge is None:
         raise ValueError(f"Kanten-ID '{reference}' nicht gefunden.")
     return edge, "geometry-id"
+
+
+def _build_face_collection(app, comp_def, face_specs: str):
+    """Build a FaceCollection from stable IDs or legacy body-face indices."""
+    body = comp_def.SurfaceBodies.Item(1)
+    collection = app.TransientObjects.CreateFaceCollection()
+    references = [part.strip() for part in str(face_specs).split(",") if part.strip()]
+    seen: set[str] = set()
+    for reference in references:
+        face, _ = _resolve_face_reference(body, reference)
+        geometry_id = _get_geometry_id(face, "face")
+        if geometry_id in seen:
+            continue
+        collection.Add(face)
+        seen.add(geometry_id)
+    return collection
+
+
+def _resolve_chamfer_face(body, edges, reference_face: str):
+    """Resolve or infer the face from which an asymmetric chamfer is measured."""
+    first_edge = edges.Item(1)
+    if str(reference_face).strip():
+        face, reference_kind = _resolve_face_reference(body, reference_face)
+    else:
+        try:
+            face = first_edge.Faces.Item(1)
+        except Exception as exc:
+            raise RuntimeError(
+                "Could not infer the chamfer reference face. Pass reference_face "
+                "using a geometry_id returned by list_faces."
+            ) from exc
+        reference_kind = "inferred"
+
+    first_edge_id = _get_geometry_id(first_edge, "edge")
+    belongs_to_face = any(
+        _get_geometry_id(face.Edges.Item(index), "edge") == first_edge_id
+        for index in range(1, face.Edges.Count + 1)
+    )
+    if not belongs_to_face:
+        raise ValueError("The first selected edge does not belong to reference_face.")
+    return face, reference_kind
 
 
 # ---------------------------------------------------------------------------
@@ -1527,7 +1727,7 @@ def add_fillet(radius_mm: float, edges: str = "all") -> str:
     doc.Activate()
     comp_def = doc.ComponentDefinition
 
-    edge_coll = _filtered_edges(app, comp_def, edges)
+    edge_coll, _ = _build_edge_collection(app, comp_def, edges)
     comp_def.Features.FilletFeatures.AddSimple(edge_coll, _mm_to_cm(radius_mm))
     return (
         f"Verrundung ({edges}) angewendet: Radius {radius_mm} mm "
@@ -1536,30 +1736,99 @@ def add_fillet(radius_mm: float, edges: str = "all") -> str:
 
 
 @mcp.tool()
-def add_chamfer(distance_mm: float, edges: str = "all") -> str:
-    """
-    Fast Kanten des ersten Volumenkoerpers mit gegebener Distanz.
+def add_chamfer(
+    distance_mm: float,
+    edges: str = "all",
+    method: str = "distance",
+    second_distance_mm: float = 0.0,
+    angle_deg: float = 45.0,
+    reference_face: str = "",
+    automatic_edge_chain: bool = True,
+    corner_setback: bool = True,
+    preserve_all_features: bool = False,
+) -> str:
+    """Create an equal-distance, two-distance, or distance-angle chamfer.
 
-    Args:
-        distance_mm: Fasenbreite (mm).
-        edges:       Welche Kanten: "all" (Standard), "top", "bottom" oder
-                     "vertical".
+    ``edges`` accepts ``all``, ``top``, ``bottom``, ``vertical``, stable
+    ``face_id/edge_id`` references, and legacy ``F1:E1`` references.
+    ``method`` is ``distance``, ``two_distances``, or ``distance_angle``.
+    Asymmetric methods use ``reference_face`` to define which adjacent face
+    receives the first distance or from which the angle is measured.  When it
+    is omitted, the first adjacent face of the first edge is used.
     """
-    if distance_mm <= 0:
-        raise ValueError("Distanz muss groesser als 0 sein.")
+    if not math.isfinite(distance_mm) or distance_mm <= 0:
+        raise ValueError("distance_mm must be greater than zero.")
+
+    normalized_method = str(method).strip().lower().replace("-", "_")
+    aliases = {
+        "equal": "distance",
+        "equal_distance": "distance",
+        "two_distance": "two_distances",
+        "angle": "distance_angle",
+    }
+    normalized_method = aliases.get(normalized_method, normalized_method)
+    allowed_methods = ("distance", "two_distances", "distance_angle")
+    if normalized_method not in allowed_methods:
+        raise ValueError(
+            f"Unknown chamfer method '{method}'. Allowed values: "
+            + ", ".join(allowed_methods)
+            + "."
+        )
+    if normalized_method == "two_distances" and (
+        not math.isfinite(second_distance_mm) or second_distance_mm <= 0
+    ):
+        raise ValueError("second_distance_mm must be greater than zero.")
+    if normalized_method == "distance_angle" and (
+        not math.isfinite(angle_deg) or not 0 < angle_deg < 90
+    ):
+        raise ValueError("angle_deg must be greater than 0 and less than 90.")
 
     app = _get_app()
     doc = _require_part_document(app)
     doc.Activate()
     comp_def = doc.ComponentDefinition
 
-    edge_coll = _filtered_edges(app, comp_def, edges)
-    comp_def.Features.ChamferFeatures.AddUsingDistance(
-        edge_coll, _mm_to_cm(distance_mm), True
-    )
+    edge_coll, selection = _build_edge_collection(app, comp_def, edges)
+    chamfers = comp_def.Features.ChamferFeatures
+    reference_kind = "not-used"
+    if normalized_method == "distance":
+        chamfer = chamfers.AddUsingDistance(
+            edge_coll,
+            _mm_to_cm(distance_mm),
+            automatic_edge_chain,
+            corner_setback,
+            preserve_all_features,
+        )
+        detail = f"distance {distance_mm} mm"
+    else:
+        body = comp_def.SurfaceBodies.Item(1)
+        face, reference_kind = _resolve_chamfer_face(
+            body, edge_coll, reference_face
+        )
+        if normalized_method == "two_distances":
+            chamfer = chamfers.AddUsingTwoDistances(
+                edge_coll,
+                face,
+                _mm_to_cm(distance_mm),
+                _mm_to_cm(second_distance_mm),
+                automatic_edge_chain,
+                preserve_all_features,
+            )
+            detail = f"distances {distance_mm} mm / {second_distance_mm} mm"
+        else:
+            chamfer = chamfers.AddUsingDistanceAndAngle(
+                edge_coll,
+                face,
+                _mm_to_cm(distance_mm),
+                math.radians(angle_deg),
+                automatic_edge_chain,
+                preserve_all_features,
+            )
+            detail = f"distance {distance_mm} mm at {angle_deg} degrees"
     return (
-        f"Fase ({edges}) angewendet: Distanz {distance_mm} mm "
-        f"auf {edge_coll.Count} Kante(n)."
+        f"Chamfer '{chamfer.Name}' created using {normalized_method}: {detail} "
+        f"on {edge_coll.Count} edge(s) from '{selection}' "
+        f"(reference face: {reference_kind})."
     )
 
 
@@ -1567,18 +1836,33 @@ def add_chamfer(distance_mm: float, edges: str = "all") -> str:
 # SHELL, DRAFT, MIRROR
 # ===========================================================================
 @mcp.tool()
-def shell(wall_thickness_mm: float, remove_faces: str = "") -> str:
-    """
-    Schoepft den Koerper (aushoehlen) mit gleichmaessiger Wandstaerke.
+def shell(
+    wall_thickness_mm: float,
+    remove_faces: str = "",
+    direction: str = "inside",
+) -> str:
+    """Create a uniform shell (German: Wandung) on the first solid body.
 
-    Args:
-        wall_thickness_mm: Wandstaerke in mm.
-        remove_faces:      Kommagetrennte Indizes von Flaechen, die entfernt
-                           werden sollen ( offen lassen = Hohlkoerper ).
-                           Beispiel: "1,3" entfernt Flaeche 1 und 3.
+    ``remove_faces`` is a comma-separated list of stable ``geometry_id``
+    values from ``list_faces``. Numeric legacy face indices remain supported.
+    Leave it empty for a completely enclosed hollow body. ``direction`` can
+    be ``inside``, ``outside``, or ``both``.
     """
-    if wall_thickness_mm <= 0:
-        raise ValueError("Wandstaerke muss groesser als 0 sein.")
+    if not math.isfinite(wall_thickness_mm) or wall_thickness_mm <= 0:
+        raise ValueError("wall_thickness_mm must be greater than zero.")
+
+    normalized_direction = str(direction).strip().lower().replace("-", "_")
+    direction_aliases = {
+        "in": "inside",
+        "out": "outside",
+        "both_sides": "both",
+        "symmetric": "both",
+    }
+    normalized_direction = direction_aliases.get(
+        normalized_direction, normalized_direction
+    )
+    if normalized_direction not in ("inside", "outside", "both"):
+        raise ValueError("direction must be inside, outside, or both.")
 
     app = _get_app()
     doc = _require_part_document(app)
@@ -1588,27 +1872,32 @@ def shell(wall_thickness_mm: float, remove_faces: str = "") -> str:
     if comp_def.SurfaceBodies.Count == 0:
         raise RuntimeError("Kein Volumenkoerper vorhanden.")
 
-    thickness = _mm_to_cm(wall_thickness_mm)
-
-    # Optionale Faces zum Entfernen.
+    direction_map = {
+        "inside": _const.kInsideShellDirection,
+        "outside": _const.kOutsideShellDirection,
+        "both": _const.kBothSidesShellDirection,
+    }
+    # Inventor expects None for an enclosed shell and a FaceCollection for
+    # an open shell. Stable IDs avoid relying on topology collection order.
     face_coll = None
     if remove_faces.strip():
-        face_coll = app.TransientObjects.CreateFaceCollection()
-        body = comp_def.SurfaceBodies.Item(1)
-        for idx_str in remove_faces.split(","):
-            idx = int(idx_str.strip())
-            if idx < 1 or idx > body.Faces.Count:
-                raise ValueError(f"Flaechen-Index {idx} ungueltig.")
-            face_coll.Add(body.Faces.Item(idx))
+        face_coll = _build_face_collection(app, comp_def, remove_faces)
 
     shell_def = comp_def.Features.ShellFeatures.CreateShellDefinition(
-        face_coll, thickness
+        face_coll,
+        _mm_to_cm(wall_thickness_mm),
+        direction_map[normalized_direction],
     )
-    comp_def.Features.ShellFeatures.Add(shell_def)
+    shell_feature = comp_def.Features.ShellFeatures.Add(shell_def)
 
     return (
-        f"Shell erstellt: Wandstaerke {wall_thickness_mm} mm"
-        + (f", {len(remove_faces.split(','))} Flaeche(n) entfernt." if remove_faces.strip() else " (Hohlkoerper).")
+        f"Shell '{shell_feature.Name}' created with {wall_thickness_mm} mm "
+        f"thickness directed {normalized_direction}; "
+        + (
+            f"{face_coll.Count} face(s) removed."
+            if face_coll is not None
+            else "no faces removed (enclosed hollow body)."
+        )
     )
 
 
@@ -2471,10 +2760,11 @@ def change_fillet_edges(feature_name: str, edges: str) -> str:
 
 @mcp.tool()
 def change_chamfer_edges(feature_name: str, edges: str) -> str:
-    """
-    Ändert die Kanten-Auswahl eines bestehenden Chamfer-Features.
-    Das Feature wird geloescht und mit den neuen Kanten neu erstellt.
-    Distanz und andere Einstellungen bleiben erhalten.
+    """Change the selection of an equal-distance chamfer.
+
+    Two-distance and distance-angle chamfers are intentionally rejected here
+    because recreating them also requires an unambiguous reference face. Use
+    ``add_chamfer`` with the desired method after deleting those features.
 
     Args:
         feature_name: Name des Chamfer-Features (z. B. "Chamfer1").
@@ -2487,18 +2777,38 @@ def change_chamfer_edges(feature_name: str, edges: str) -> str:
 
     feat = _get_chamfer_feature(comp_def, feature_name)
 
-    # Alte Distanz auslesen.
     try:
-        dist_cm = feat.Parameters.Item(1).Value
+        definition = feat.Definition
+        definition_type = definition.DefinitionType
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not read the definition of chamfer '{feature_name}': {exc}"
+        ) from exc
+    if definition_type != _const.kDistance:
+        raise RuntimeError(
+            "change_chamfer_edges only supports equal-distance chamfers. "
+            "Delete this asymmetric chamfer and recreate it with add_chamfer "
+            "so reference_face remains explicit."
+        )
+
+    try:
+        dist_cm = definition.Distance.Value
         dist_mm = dist_cm * 10.0
     except Exception:
         dist_mm = None
 
-    # Alte Einstellungen auslesen.
     try:
-        auto_chain = feat.AutomaticEdgeChain
+        auto_chain = definition.AutomaticEdgeChain
     except Exception:
         auto_chain = True
+    try:
+        corner_setback = definition.CornerSetback
+    except Exception:
+        corner_setback = True
+    try:
+        preserve_all_features = definition.PreserveAllFeatures
+    except Exception:
+        preserve_all_features = False
 
     # Neue Kanten bauen.
     new_edges, _ = _build_edge_collection(app, comp_def, edges)
@@ -2509,11 +2819,19 @@ def change_chamfer_edges(feature_name: str, edges: str) -> str:
     # Neues Feature mit gleichen Einstellungen erstellen.
     if dist_mm is not None:
         comp_def.Features.ChamferFeatures.AddUsingDistance(
-            new_edges, _mm_to_cm(dist_mm), auto_chain
+            new_edges,
+            _mm_to_cm(dist_mm),
+            auto_chain,
+            corner_setback,
+            preserve_all_features,
         )
     else:
         comp_def.Features.ChamferFeatures.AddUsingDistance(
-            new_edges, 0.1, auto_chain
+            new_edges,
+            0.1,
+            auto_chain,
+            corner_setback,
+            preserve_all_features,
         )
 
     return (
@@ -2711,20 +3029,65 @@ def sweep(
     profile_diameter_mm: float,
     path_points: str,
     operation: str = "new",
+    profile_shape: str = "circle",
+    profile_width_mm: float = 0.0,
+    profile_height_mm: float = 0.0,
+    profile_orientation: str = "normal",
+    twist_angle_deg: float = 0.0,
+    taper_angle_deg: float = 0.0,
 ) -> str:
-    """
-    Erzeugt einen Sweep: Kreisprofil entlang eines 3D-Pfads.
+    """Sweep a circle or rectangle along a connected polyline in 3D space.
 
-    Args:
-        profile_diameter_mm: Durchmesser des Kreisprofils (mm).
-        path_points:         Kommagetrennte 3D-Punkte des Pfads.
-                             Format: "x1,y1,z1;x2,y2,z2;x3,y3,z3" (in mm).
-                             Mindestens 2 Punkte.
-        operation:           "new" = neuer Koerper, "join" = mit bestehendem
-                             verbinden, "cut" = Material abtragen.
+    ``path_points`` uses ``x,y,z;x,y,z`` coordinates in millimetres. The
+    profile is created at the first point on a construction plane normal to
+    the first segment. ``profile_shape`` is ``circle`` or ``rectangle``.
+    Rectangle profiles require ``profile_width_mm`` and
+    ``profile_height_mm``. Orientation is ``normal`` or ``parallel``.
     """
-    if profile_diameter_mm <= 0:
-        raise ValueError("Durchmesser muss groesser als 0 sein.")
+    normalized_shape = str(profile_shape).strip().lower()
+    if normalized_shape not in ("circle", "rectangle", "rect"):
+        raise ValueError("profile_shape must be circle or rectangle.")
+    if normalized_shape == "circle" and (
+        not math.isfinite(profile_diameter_mm) or profile_diameter_mm <= 0
+    ):
+        raise ValueError("profile_diameter_mm must be greater than zero.")
+    if normalized_shape in ("rectangle", "rect") and (
+        not math.isfinite(profile_width_mm)
+        or not math.isfinite(profile_height_mm)
+        or profile_width_mm <= 0
+        or profile_height_mm <= 0
+    ):
+        raise ValueError(
+            "Rectangle sweeps require positive profile_width_mm and "
+            "profile_height_mm values."
+        )
+    normalized_orientation = str(profile_orientation).strip().lower()
+    orientation_aliases = {
+        "normal_to_path": "normal",
+        "perpendicular": "normal",
+        "parallel_to_profile": "parallel",
+    }
+    normalized_orientation = orientation_aliases.get(
+        normalized_orientation, normalized_orientation
+    )
+    if normalized_orientation not in ("normal", "parallel"):
+        raise ValueError("profile_orientation must be normal or parallel.")
+    if not math.isfinite(twist_angle_deg):
+        raise ValueError("twist_angle_deg must be finite.")
+    if not math.isfinite(taper_angle_deg) or not -89 < taper_angle_deg < 89:
+        raise ValueError("taper_angle_deg must be finite and between -89 and 89.")
+    if normalized_orientation == "parallel" and (
+        twist_angle_deg or taper_angle_deg
+    ):
+        raise ValueError(
+            "twist_angle_deg and taper_angle_deg require normal orientation."
+        )
+    normalized_operation = str(operation).strip().lower()
+    if normalized_operation not in ("new", "join", "cut", "intersect"):
+        raise ValueError("Sweep operation must be new, join, cut, or intersect.")
+
+    points_mm = _parse_3d_point_string(path_points)
+    x_axis, y_axis = _normal_plane_axes(points_mm[0], points_mm[1])
 
     app = _get_app()
     doc = _require_part_document(app)
@@ -2732,66 +3095,76 @@ def sweep(
     comp_def = doc.ComponentDefinition
     tg = app.TransientGeometry
 
-    # Pfad-Punkte parsen.
-    raw_points = [p.strip() for p in path_points.split(";") if p.strip()]
-    if len(raw_points) < 2:
-        raise ValueError("Mindestens 2 Pfadpunkte noetig.")
+    points_cm = [
+        tg.CreatePoint(*(_mm_to_cm(value) for value in point))
+        for point in points_mm
+    ]
 
-    points_cm = []
-    for pt_str in raw_points:
-        parts = pt_str.split(",")
-        if len(parts) != 3:
-            raise ValueError(f"Ungueltiger Punkt: '{pt_str}'. Erwartet 'x,y,z'.")
-        x, y, z = [_mm_to_cm(float(v)) for v in parts]
-        points_cm.append(tg.CreatePoint(x, y, z))
-
-    # 3D-Skizze fuer den Pfad.
+    # Build one connected 3D sketch. CreatePath discovers every curve that is
+    # connected to the supplied first curve, preserving the intended start.
     sketch3d = comp_def.Sketches3D.Add()
-    wp_list = []
-    for p in points_cm:
-        wp = comp_def.WorkPoints.AddFixed(p)
-        wp_list.append(wp)
-
-    line = sketch3d.SketchLines3D.AddByTwoPoints(wp_list[0], wp_list[1], True)
-    for i in range(2, len(wp_list)):
-        line = sketch3d.SketchLines3D.AddByTwoPoints(
-            line.EndPoint, wp_list[i], True
-        )
-
-    # Path aus der letzten Linie erstellen.
-    path = comp_def.Features.CreatePath(line)
-
-    # Profil-Skizze: Ebene senkrecht zum Pfad-Anfang.
-    # WorkPlane durch den Startpunkt der Pfadlinie, senkrecht zur Linie.
-    start_pt = points_cm[0]
-    end_pt = points_cm[1]
-    direction = tg.CreateVector(
-        end_pt.X - start_pt.X,
-        end_pt.Y - start_pt.Y,
-        end_pt.Z - start_pt.Z,
+    work_points = [comp_def.WorkPoints.AddFixed(point) for point in points_cm]
+    first_line = sketch3d.SketchLines3D.AddByTwoPoints(
+        work_points[0], work_points[1], True
     )
+    previous_line = first_line
+    for index in range(2, len(work_points)):
+        previous_line = sketch3d.SketchLines3D.AddByTwoPoints(
+            previous_line.EndPoint, work_points[index], True
+        )
+    path = comp_def.Features.CreatePath(first_line)
 
-    # Profil auf der XY-Ebene, Kreis zentriert auf (0,0).
-    # Die Skizze wird spaeter durch das Sweep-Features.AddUsingPath
-    # automatisch auf den Pfad-Anfang projiziert.
-    sketch2d = comp_def.Sketches.Add(comp_def.WorkPlanes.Item(3))
-    radius = _mm_to_cm(profile_diameter_mm) / 2.0
-    sketch2d.SketchCircles.AddByCenterRadius(tg.CreatePoint2d(0, 0), radius)
+    # A fixed construction plane is reliable for straight and curved path
+    # starts. AddByNormalToCurve has curve-type restrictions in Inventor's
+    # API, while AddFixed accepts an explicit orthonormal coordinate frame.
+    profile_plane = comp_def.WorkPlanes.AddFixed(
+        points_cm[0],
+        tg.CreateUnitVector(*x_axis),
+        tg.CreateUnitVector(*y_axis),
+        True,
+    )
+    sketch2d = comp_def.Sketches.Add(profile_plane)
+    centre = sketch2d.ModelToSketchSpace(points_cm[0])
+
+    if normalized_shape == "circle":
+        sketch2d.SketchCircles.AddByCenterRadius(
+            centre, _mm_to_cm(profile_diameter_mm) / 2.0
+        )
+        profile_detail = f"circle D {profile_diameter_mm} mm"
+    else:
+        half_width = _mm_to_cm(profile_width_mm) / 2.0
+        half_height = _mm_to_cm(profile_height_mm) / 2.0
+        sketch2d.SketchLines.AddAsTwoPointRectangle(
+            tg.CreatePoint2d(centre.X - half_width, centre.Y - half_height),
+            tg.CreatePoint2d(centre.X + half_width, centre.Y + half_height),
+        )
+        profile_detail = f"rectangle {profile_width_mm} x {profile_height_mm} mm"
     profile = sketch2d.Profiles.AddForSolid()
 
-    # Sweep-Operation.
-    op_map = {
-        "new": _const.kNewBodyOperation,
-        "join": _const.kJoinOperation,
-        "cut": _const.kCutOperation,
+    sweep_features = comp_def.Features.SweepFeatures
+    sweep_definition = sweep_features.CreateSweepDefinition(
+        _const.kPathSweepType,
+        profile,
+        path,
+        _parse_feature_operation(normalized_operation),
+    )
+    orientation_map = {
+        "normal": _const.kNormalToPath,
+        "parallel": _const.kParallelToOriginalProfile,
     }
-    op = op_map.get(operation.lower(), _const.kNewBodyOperation)
-
-    comp_def.Features.SweepFeatures.AddUsingPath(profile, path, op)
+    sweep_definition.ProfileOrientation = orientation_map[normalized_orientation]
+    if normalized_orientation == "normal":
+        if twist_angle_deg:
+            sweep_definition.TwistAngle = f"{twist_angle_deg} deg"
+        if taper_angle_deg:
+            sweep_definition.TaperAngle = f"{taper_angle_deg} deg"
+    sweep_feature = sweep_features.Add(sweep_definition)
 
     return (
-        f"Sweep erstellt: Profil D {profile_diameter_mm} mm, "
-        f"{len(points_cm)} Pfadpunkte, Operation '{operation}'."
+        f"Sweep '{sweep_feature.Name}' created with {profile_detail}, "
+        f"{len(points_cm)} path points, {normalized_orientation} orientation, "
+        f"twist {twist_angle_deg} degrees, taper {taper_angle_deg} degrees, "
+        f"operation '{normalized_operation}'."
     )
 
 
@@ -2799,79 +3172,80 @@ def sweep(
 def loft(
     sections: str,
     operation: str = "new",
+    closed: bool = False,
+    merge_tangent_faces: bool = True,
 ) -> str:
-    """
-    Erzeugt einen Loft (Uebergang) zwischen mehreren Profilen auf
-    verschiedenen Ebenen.
+    """Create a loft (German: Erhebung) through circle/rectangle sections.
 
-    Args:
-        sections:  Profil-Spezifikationen, semikolongetrennt.
-                   Jedes Profil: "ebene:durchmesser_mm"
-                   Ebenen: "XY", "XZ", "YZ" oder "höhe_mm" (Abstand von XY).
-                   Beispiel: "XY:50;30:40;60:30" = Kreis D50 auf XY,
-                             D40 in 30mm Hoehe, D30 in 60mm Hoehe.
-        operation: "new" = neuer Koerper, "join" = verbinden, "cut" = schneiden.
+    The legacy circle format remains supported: ``XY:50;30:40;60:30``.
+    Structured sections use one of these forms (all dimensions in mm):
+    ``plane|circle|diameter[|centre_x|centre_y]`` or
+    ``plane|rectangle|width|height[|centre_x|centre_y]``.
+    A numeric plane means an offset from XY; XY, XZ, YZ, offset work planes
+    such as ``XY:30``, and named work planes are also accepted.
     """
+    parsed_sections = _parse_loft_sections(sections)
+    normalized_operation = str(operation).strip().lower()
+    if normalized_operation not in ("new", "join", "cut", "intersect"):
+        raise ValueError("Loft operation must be new, join, cut, or intersect.")
+    if closed and len(parsed_sections) < 3:
+        raise ValueError("A closed loft requires at least three sections.")
+
     app = _get_app()
     doc = _require_part_document(app)
     doc.Activate()
     comp_def = doc.ComponentDefinition
     tg = app.TransientGeometry
 
-    section_parts = [s.strip() for s in sections.split(";") if s.strip()]
-    if len(section_parts) < 2:
-        raise ValueError("Mindestens 2 Profile noetig.")
-
     sections_coll = app.TransientObjects.CreateObjectCollection()
 
-    for sec_str in section_parts:
-        parts = sec_str.split(":")
-        if len(parts) != 2:
-            raise ValueError(
-                f"Ungueltige Profil-Angabe: '{sec_str}'. "
-                "Erwartet 'ebene:durchmesser_mm'."
-            )
-        plane_str, diam_str = parts[0].strip(), parts[1].strip()
-        diameter_mm = float(diam_str)
-        if diameter_mm <= 0:
-            raise ValueError("Durchmesser muss > 0 sein.")
-
-        # Ebene bestimmen.
-        plane_upper = plane_str.upper()
-        if plane_upper in ("XY", "XZ", "YZ"):
-            plane_map = {"XY": 3, "XZ": 2, "YZ": 1}
-            work_plane = comp_def.WorkPlanes.Item(plane_map[plane_upper])
-        else:
-            # Als Hoehe in mm interpretieren -> WorkPlane per Offset.
-            height_mm = float(plane_str)
-            height_cm = _mm_to_cm(height_mm)
+    section_descriptions = []
+    for section in parsed_sections:
+        plane_spec = section["plane"]
+        try:
+            height_mm = float(plane_spec)
             work_plane = comp_def.WorkPlanes.AddByPlaneAndOffset(
-                comp_def.WorkPlanes.Item(3), height_cm,
+                comp_def.WorkPlanes.Item(3), _mm_to_cm(height_mm), True
             )
+        except ValueError:
+            work_plane = _resolve_work_plane(comp_def, plane_spec)
 
-        # Skizze mit Kreis auf der Ebene.
         sketch = comp_def.Sketches.Add(work_plane)
-        sketch.SketchCircles.AddByCenterRadius(
-            tg.CreatePoint2d(0, 0), _mm_to_cm(diameter_mm) / 2.0
+        centre = tg.CreatePoint2d(
+            _mm_to_cm(section["center_x_mm"]),
+            _mm_to_cm(section["center_y_mm"]),
         )
+        if section["shape"] == "circle":
+            sketch.SketchCircles.AddByCenterRadius(
+                centre, _mm_to_cm(section["diameter_mm"]) / 2.0
+            )
+            detail = f"circle D {section['diameter_mm']} mm"
+        else:
+            half_width = _mm_to_cm(section["width_mm"]) / 2.0
+            half_height = _mm_to_cm(section["height_mm"]) / 2.0
+            sketch.SketchLines.AddAsTwoPointRectangle(
+                tg.CreatePoint2d(centre.X - half_width, centre.Y - half_height),
+                tg.CreatePoint2d(centre.X + half_width, centre.Y + half_height),
+            )
+            detail = (
+                f"rectangle {section['width_mm']} x {section['height_mm']} mm"
+            )
         profile = sketch.Profiles.AddForSolid()
         sections_coll.Add(profile)
-
-    op_map = {
-        "new": _const.kNewBodyOperation,
-        "join": _const.kJoinOperation,
-        "cut": _const.kCutOperation,
-    }
-    op = op_map.get(operation.lower(), _const.kNewBodyOperation)
+        section_descriptions.append(f"{plane_spec}: {detail}")
 
     loft_def = comp_def.Features.LoftFeatures.CreateLoftDefinition(
-        sections_coll, op
+        sections_coll, _parse_feature_operation(normalized_operation)
     )
-    comp_def.Features.LoftFeatures.Add(loft_def)
+    loft_def.Closed = bool(closed)
+    loft_def.MergeTangentFaces = bool(merge_tangent_faces)
+    loft_feature = comp_def.Features.LoftFeatures.Add(loft_def)
 
     return (
-        f"Loft erstellt: {len(section_parts)} Profile, "
-        f"Operation '{operation}'."
+        f"Loft '{loft_feature.Name}' created through {len(parsed_sections)} "
+        f"sections ({'; '.join(section_descriptions)}), "
+        f"closed={bool(closed)}, merge_tangent_faces={bool(merge_tangent_faces)}, "
+        f"operation '{normalized_operation}'."
     )
 
 
