@@ -3,7 +3,7 @@ import types
 import unittest
 from unittest.mock import patch
 
-from proxmox_client import ProxmoxError
+from proxmox_client import LxcConsoleResult, ProxmoxError
 
 
 class FakeFastMCP:
@@ -36,6 +36,17 @@ class FakeClient:
     def request(self, method, path, **kwargs):
         self.calls.append((method, path, kwargs))
         return {"data": "ok"}
+
+    def lxc_console_exec(self, **kwargs):
+        self.calls.append(("lxc_console_exec", kwargs))
+        return LxcConsoleResult(
+            node=kwargs["node"],
+            vmid=kwargs["vmid"],
+            command=kwargs["command"],
+            output="root",
+            exit_code=0,
+            duration_seconds=0.25,
+        )
 
 
 class ProxmoxServerTests(unittest.TestCase):
@@ -73,6 +84,34 @@ class ProxmoxServerTests(unittest.TestCase):
         self.assertEqual(
             client.calls,
             [("GET", "/nodes/pve1/qemu", {"query": {"schema": 1}})],
+        )
+
+    def test_lxc_console_exec_requires_explicit_confirmation(self):
+        with self.assertRaisesRegex(ProxmoxError, "confirm=true"):
+            server.pve_lxc_console_exec("pve1", 101, "id")
+
+    def test_confirmed_lxc_console_exec_is_forwarded(self):
+        client = FakeClient()
+        with patch.object(server, "_client", return_value=client):
+            result = server.pve_lxc_console_exec(
+                "pve1", 101, "id", timeout_seconds=20.0, confirm=True
+            )
+
+        self.assertEqual(result["output"], "root")
+        self.assertEqual(result["exit_code"], 0)
+        self.assertEqual(
+            client.calls,
+            [
+                (
+                    "lxc_console_exec",
+                    {
+                        "node": "pve1",
+                        "vmid": 101,
+                        "command": "id",
+                        "timeout_seconds": 20.0,
+                    },
+                )
+            ],
         )
 
 

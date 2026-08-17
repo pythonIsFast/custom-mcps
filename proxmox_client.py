@@ -3,14 +3,23 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+import re
+import ssl
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, urlencode, urlsplit
 
 import requests
+
+try:
+    import websocket
+except ImportError:  # pragma: no cover - exercised through the runtime error
+    websocket = None  # type: ignore[assignment]
 
 
 API_PREFIX = "/api2/json"
@@ -19,6 +28,14 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 SUPPORTED_METHODS = frozenset(
     {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"}
+)
+MAX_CONSOLE_COMMAND_BYTES = 64 * 1024
+MAX_CONSOLE_OUTPUT_BYTES = 1024 * 1024
+_NODE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_ANSI_ESCAPE_RE = re.compile(
+    r"(?:\x1B\][^\x07]*(?:\x07|\x1B\\))|"
+    r"(?:\x1B\[[0-?]*[ -/]*[@-~])|"
+    r"(?:\x1B[@-_])"
 )
 
 
@@ -127,6 +144,18 @@ class ProxmoxSettings:
         except OSError:
             pass
         return f"protected file ({CONFIG_FILE})"
+
+
+@dataclass(frozen=True)
+class LxcConsoleResult:
+    """Result of a command executed through an LXC terminal proxy."""
+
+    node: str
+    vmid: int
+    command: str
+    output: str
+    exit_code: int
+    duration_seconds: float
 
 
 class ProxmoxClient:
@@ -275,3 +304,283 @@ class ProxmoxClient:
 
     def task_status(self, node: str, upid: str) -> Any:
         return self.request("GET", f"/nodes/{node}/tasks/{upid}/status")
+
+    @staticmethod
+    def _terminal_input_frame(data: str) -> bytes:
+        """Encode terminal input using pve-xtermjs' byte-length framing."""
+        payload = data.encode("utf-8")
+        return b"0:" + str(len(payload)).encode("ascii") + b":" + payload
+
+    @staticmethod
+    def _terminal_bytes(message: Any) -> bytes:
+        if isinstance(message, bytes):
+            return message
+        if isinstance(message, str):
+            return message.encode("utf-8")
+        raise ProxmoxError(
+            f"Proxmox returned an unsupported WebSocket message type: "
+            f"{type(message).__name__}."
+        )
+
+    @staticmethod
+    def _clean_terminal_output(raw_output: bytes) -> str:
+        """Make terminal output readable without dropping normal Unicode."""
+        text = raw_output.decode("utf-8", errors="replace")
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        text = _ANSI_ESCAPE_RE.sub("", text)
+        text = "".join(
+            character
+            for character in text
+            if character in {"\n", "\t"} or ord(character) >= 32
+        )
+        return text.strip()
+
+    @staticmethod
+    def _validate_lxc_console_arguments(
+        node: str,
+        vmid: int,
+        command: str,
+        timeout_seconds: float,
+    ) -> tuple[str, int, str, float]:
+        node = str(node).strip()
+        if not _NODE_NAME_RE.fullmatch(node):
+            raise ProxmoxError(
+                "node must start with an alphanumeric character and contain "
+                "only letters, numbers, dots, underscores, or hyphens."
+            )
+        if (
+            isinstance(vmid, bool)
+            or not isinstance(vmid, int)
+            or not 1 <= vmid <= 999_999_999
+        ):
+            raise ProxmoxError("vmid must be an integer between 1 and 999999999.")
+        if not isinstance(command, str) or not command.strip():
+            raise ProxmoxError("command must be a non-empty string.")
+        if "\x00" in command:
+            raise ProxmoxError("command cannot contain NUL bytes.")
+        command_size = len(command.encode("utf-8"))
+        if command_size > MAX_CONSOLE_COMMAND_BYTES:
+            raise ProxmoxError(
+                f"command exceeds the {MAX_CONSOLE_COMMAND_BYTES}-byte limit."
+            )
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not math.isfinite(float(timeout_seconds))
+            or not 0.5 <= float(timeout_seconds) <= 300.0
+        ):
+            raise ProxmoxError("timeout_seconds must be between 0.5 and 300.")
+        return node, vmid, command, float(timeout_seconds)
+
+    def _lxc_websocket_url(
+        self,
+        node: str,
+        vmid: int,
+        port: int,
+        ticket: str,
+    ) -> str:
+        parts = urlsplit(self.settings.url)
+        query = urlencode({"port": port, "vncticket": ticket})
+        path = self.normalize_path(f"/nodes/{node}/lxc/{vmid}/vncwebsocket")
+        return f"wss://{parts.netloc}{API_PREFIX}{path}?{query}"
+
+    def _require_lxc_shell_console(self, node: str, vmid: int) -> None:
+        """Reject login-based consoles before sending command input."""
+        config = self.request("GET", f"/nodes/{node}/lxc/{vmid}/config")
+        if not isinstance(config, Mapping):
+            raise ProxmoxError("Proxmox returned an invalid LXC configuration.")
+        cmode = config.get("cmode", "tty")
+        if cmode != "shell":
+            raise ProxmoxError(
+                f"LXC container {vmid} uses console mode {cmode!r}. Console "
+                "command execution requires cmode='shell' because tty and "
+                "console modes may present an interactive login prompt. Set "
+                f"it with 'pct set {vmid} --cmode shell' or in the Proxmox "
+                "container options, then retry."
+            )
+
+    def _open_lxc_terminal_websocket(
+        self,
+        node: str,
+        vmid: int,
+        port: int,
+        ticket: str,
+        timeout_seconds: float,
+    ) -> Any:
+        if websocket is None:
+            raise ProxmoxError(
+                "LXC console execution requires the 'websocket-client' package."
+            )
+        ssl_options: dict[str, Any] = {"cert_reqs": ssl.CERT_REQUIRED}
+        if not self.settings.verify_tls:
+            ssl_options.update(
+                {"cert_reqs": ssl.CERT_NONE, "check_hostname": False}
+            )
+        try:
+            return websocket.create_connection(
+                self._lxc_websocket_url(node, vmid, port, ticket),
+                timeout=min(timeout_seconds, self.settings.timeout_seconds),
+                header=[
+                    "Authorization: "
+                    f"PVEAPIToken={self.settings.token_id}={self.settings.token_secret}"
+                ],
+                origin=f"https://{urlsplit(self.settings.url).netloc}",
+                subprotocols=["binary"],
+                sslopt=ssl_options,
+            )
+        except Exception as exc:
+            message = str(exc)
+            if "401" in message or "403" in message:
+                raise ProxmoxError(
+                    "Proxmox rejected the LXC console WebSocket upgrade. The "
+                    "token needs VM.Console permission and the installed PVE "
+                    "version must support API-token authentication for "
+                    "vncwebsocket. Older PVE releases only accept user session "
+                    f"tickets. Details: {message}"
+                ) from exc
+            raise ProxmoxError(
+                f"Could not open the Proxmox LXC console WebSocket: {message}"
+            ) from exc
+
+    def lxc_console_exec(
+        self,
+        node: str,
+        vmid: int,
+        command: str,
+        timeout_seconds: float = 15.0,
+    ) -> LxcConsoleResult:
+        """Execute one shell command through an LXC xterm.js console.
+
+        Proxmox does not expose a Guest Agent exec endpoint for LXC guests.
+        This method therefore creates a short-lived termproxy, authenticates
+        its WebSocket protocol, and runs the command through ``/bin/sh``.
+        Completion is detected with a random marker assembled from two shell
+        strings, preventing the terminal's command echo from matching it.
+        """
+        node, vmid, command, timeout_seconds = self._validate_lxc_console_arguments(
+            node, vmid, command, timeout_seconds
+        )
+        self._require_lxc_shell_console(node, vmid)
+        proxy = self.request("POST", f"/nodes/{node}/lxc/{vmid}/termproxy")
+        if not isinstance(proxy, Mapping):
+            raise ProxmoxError("Proxmox returned an invalid termproxy response.")
+
+        try:
+            port = int(proxy["port"])
+            ticket = str(proxy["ticket"])
+            user = str(proxy["user"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ProxmoxError(
+                "The termproxy response must contain port, ticket, and user."
+            ) from exc
+        if not 1 <= port <= 65_535 or not ticket or not user:
+            raise ProxmoxError("Proxmox returned invalid termproxy connection data.")
+
+        started_at = time.monotonic()
+        deadline = started_at + timeout_seconds
+        connection = self._open_lxc_terminal_websocket(
+            node, vmid, port, ticket, timeout_seconds
+        )
+        authenticated = False
+        completed = False
+        marker_token = uuid.uuid4().hex
+        start_marker = f"__PVE_MCP_START_{marker_token}__"
+        start_first = f"__PVE_MCP_START_{marker_token[:16]}"
+        start_second = f"{marker_token[16:]}__"
+        marker = f"__PVE_MCP_DONE_{marker_token}__"
+        marker_first = f"__PVE_MCP_DONE_{marker_token[:16]}"
+        marker_second = f"{marker_token[16:]}__"
+        quoted_command = "'" + command.replace("'", "'\"'\"'") + "'"
+        wrapped_command = (
+            f"printf '%s%s\\n' '{start_first}' '{start_second}'; "
+            f"/bin/sh -c {quoted_command}; "
+            "__pve_mcp_rc=$?; stty echo; "
+            f"printf '\\n%s%s:%s\\n' '{marker_first}' '{marker_second}' "
+            '"$__pve_mcp_rc"\n'
+        )
+        output = bytearray()
+        marker_pattern = re.compile(
+            re.escape(marker).encode("ascii") + rb":(-?\d+)(?:\r?\n|$)"
+        )
+        start_pattern = re.compile(
+            re.escape(start_marker).encode("ascii") + rb"(?:\r?\n|$)"
+        )
+
+        try:
+            connection.send_binary(f"{user}:{ticket}\n".encode("utf-8"))
+            auth_reply = self._terminal_bytes(connection.recv())
+            if not auth_reply.startswith(b"OK"):
+                raise ProxmoxError(
+                    "The LXC terminal rejected the termproxy authentication ticket."
+                )
+            authenticated = True
+
+            # Disable local terminal echo so the encoded wrapper and command
+            # are not mixed into the returned command output.
+            connection.send_binary(self._terminal_input_frame("stty -echo\n"))
+            connection.send_binary(self._terminal_input_frame(wrapped_command))
+            connection.settimeout(min(0.25, timeout_seconds))
+
+            while time.monotonic() < deadline:
+                try:
+                    message = connection.recv()
+                except Exception as exc:
+                    if websocket is not None and isinstance(
+                        exc, websocket.WebSocketTimeoutException
+                    ):
+                        continue
+                    raise ProxmoxError(
+                        f"The LXC console WebSocket failed while reading output: {exc}"
+                    ) from exc
+                chunk = self._terminal_bytes(message)
+                if not chunk:
+                    raise ProxmoxError(
+                        "The LXC console WebSocket closed before the command completed."
+                    )
+                output.extend(chunk)
+                if len(output) > MAX_CONSOLE_OUTPUT_BYTES:
+                    raise ProxmoxError(
+                        f"LXC console output exceeded the "
+                        f"{MAX_CONSOLE_OUTPUT_BYTES}-byte safety limit."
+                    )
+                match = marker_pattern.search(output)
+                if match:
+                    start_match = start_pattern.search(output)
+                    if start_match is None or start_match.end() > match.start():
+                        raise ProxmoxError(
+                            "The LXC console returned a completion marker without "
+                            "the expected command-start marker."
+                        )
+                    clean_output = self._clean_terminal_output(
+                        output[start_match.end() : match.start()]
+                    )
+                    completed = True
+                    return LxcConsoleResult(
+                        node=node,
+                        vmid=vmid,
+                        command=command,
+                        output=clean_output,
+                        exit_code=int(match.group(1)),
+                        duration_seconds=round(time.monotonic() - started_at, 3),
+                    )
+
+            partial_output = self._clean_terminal_output(bytes(output))
+            detail = (
+                f" Partial output: {partial_output[:500]}"
+                if partial_output
+                else ""
+            )
+            raise ProxmoxError(
+                f"LXC console command timed out after {timeout_seconds} seconds."
+                + detail
+            )
+        finally:
+            if authenticated and not completed:
+                try:
+                    connection.send_binary(self._terminal_input_frame("\x03stty echo\n"))
+                except Exception:
+                    pass
+            try:
+                connection.close()
+            except Exception:
+                pass

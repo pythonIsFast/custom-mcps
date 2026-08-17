@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Expose the complete Proxmox VE JSON API to an MCP client.
 
-Credentials are read only from PVE_URL, PVE_TOKEN_ID, and PVE_TOKEN_SECRET.
-Use a deliberately scoped Proxmox API token; the server never persists it.
+Credentials come from PVE environment variables or the protected setup file.
+Use a deliberately scoped Proxmox API token.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ import getpass
 import os
 import sys
 import time
+from dataclasses import asdict
 from typing import Any
 
 from proxmox_client import (
@@ -79,6 +80,32 @@ def pve_upload_file(
     """
     _require_confirmation("POST", confirm)
     return _client().upload(path, file_path, fields=fields, file_field=file_field)
+
+
+@mcp.tool()
+def pve_lxc_console_exec(
+    node: str,
+    vmid: int,
+    command: str,
+    timeout_seconds: float = 15.0,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    """Execute a shell command inside an LXC container through its console.
+
+    This grants effective interactive root-shell access and is substantially
+    more powerful than a normal REST call. Every invocation requires an
+    explicit confirm=true after the exact node, VMID, and command were
+    reviewed. Unlike QEMU guest-agent exec, console execution is terminal
+    based; the returned exit code is captured by a shell completion marker.
+    """
+    _require_confirmation("POST", confirm)
+    result = _client().lxc_console_exec(
+        node=node,
+        vmid=vmid,
+        command=command,
+        timeout_seconds=timeout_seconds,
+    )
+    return asdict(result)
 
 
 @mcp.tool()

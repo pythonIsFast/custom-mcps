@@ -245,6 +245,7 @@ connected PVE instance.
 - Upload files through multipart API endpoints
 - List cluster resources and guests with concise convenience tools
 - Start, stop, reboot, suspend, and resume QEMU VMs and LXC containers
+- Execute confirmed shell commands inside LXC containers through Proxmox's terminal WebSocket
 - Read and wait for asynchronous Proxmox tasks (UPIDs)
 - Diagnose connectivity, PVE version, and the configured token identity
 
@@ -253,6 +254,7 @@ connected PVE instance.
 - Python 3.10 or newer
 - `fastmcp>=3,<4`
 - `requests`
+- `websocket-client`
 - Network access to the Proxmox VE API (usually HTTPS port 8006)
 - A Proxmox VE API token with deliberately scoped ACLs
 
@@ -261,7 +263,7 @@ connected PVE instance.
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install "fastmcp>=3,<4" requests
+python -m pip install "fastmcp>=3,<4" requests websocket-client
 ```
 
 Create a dedicated PVE user and API token in the Proxmox UI, then grant it
@@ -287,8 +289,11 @@ connecting to a deliberately trusted host with a self-signed certificate.
 
 Read-only API requests are available immediately. Every request with a
 state-changing HTTP method (`POST`, `PUT`, `PATCH`, or `DELETE`) requires
-`confirm=true`; uploads do too. This is an MCP-level guard, not a replacement
-for Proxmox permissions. The API token's ACLs remain the authoritative limit.
+`confirm=true`; uploads and every LXC console command do too. Console execution
+provides effective interactive root-shell access inside a container and is much
+more powerful than a normal REST endpoint. This is an MCP-level guard, not a
+replacement for Proxmox permissions. The API token's ACLs remain the
+authoritative limit, and the token needs `VM.Console` for the target container.
 
 ```text
 Use pve_api_schema for /nodes/pve1/qemu/100, then show the VM configuration.
@@ -301,6 +306,23 @@ Start VM 100 on pve1 using pve_guest_action with confirm=true, wait for its task
 ```text
 Use pve_request to create a snapshot for container 200. Inspect the endpoint schema first and ask me for confirmation before sending the request.
 ```
+
+```text
+Run "uname -a" inside LXC container 200 on pve1 with pve_lxc_console_exec.
+Show me the exact command first and only continue with confirm=true after I approve it.
+```
+
+LXC console execution uses Proxmox's xterm.js terminal protocol rather than a
+Guest Agent. It returns the captured terminal output and a shell-derived exit
+code. It times out after 15 seconds by default (configurable up to 300 seconds).
+The target container must use console mode `shell`; Proxmox defaults to the
+login-based `tty` mode, which cannot safely execute an unattended command. Set
+it with `pct set <VMID> --cmode shell` or under the container's Options in the
+Proxmox UI. Reading this setting also requires permission to read the container
+configuration (normally `VM.Audit`).
+Older PVE releases may reject API tokens during the WebSocket upgrade even when
+the REST `termproxy` call succeeds; update PVE if that compatibility error is
+reported.
 
 ## 🔌 MCP client configuration
 

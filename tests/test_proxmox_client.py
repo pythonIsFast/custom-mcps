@@ -1,5 +1,7 @@
 import json
 import unittest
+from types import SimpleNamespace
+from unittest.mock import call, patch
 
 from proxmox_client import ProxmoxClient, ProxmoxError, ProxmoxSettings
 
@@ -31,6 +33,26 @@ class FakeSession:
     def request(self, *args, **kwargs):
         self.calls.append((args, kwargs))
         return self.response
+
+
+class FakeWebSocket:
+    def __init__(self, messages):
+        self.messages = list(messages)
+        self.sent = []
+        self.timeouts = []
+        self.closed = False
+
+    def send_binary(self, message):
+        self.sent.append(message)
+
+    def recv(self):
+        return self.messages.pop(0)
+
+    def settimeout(self, value):
+        self.timeouts.append(value)
+
+    def close(self):
+        self.closed = True
 
 
 class ProxmoxClientTests(unittest.TestCase):
@@ -80,6 +102,127 @@ class ProxmoxClientTests(unittest.TestCase):
         client = ProxmoxClient(self.settings, session)
 
         self.assertEqual(client.request("GET", "/nodes/pve1/report"), "plain output")
+
+    def test_terminal_frame_uses_utf8_byte_length(self):
+        self.assertEqual(
+            ProxmoxClient._terminal_input_frame("printf 'ä'\n"),
+            "0:12:printf 'ä'\n".encode("utf-8"),
+        )
+
+    def test_lxc_console_exec_authenticates_frames_and_captures_exit_code(self):
+        token = "a" * 32
+        start = f"__PVE_MCP_START_{token}__"
+        done = f"__PVE_MCP_DONE_{token}__"
+        connection = FakeWebSocket(
+            [
+                b"OK",
+                f"root@ct:~# stty -echo\r\n{start}\r\nhello\r\n{done}:7\r\n".encode(),
+            ]
+        )
+        client = ProxmoxClient(self.settings, FakeSession(FakeResponse()))
+
+        with (
+            patch.object(
+                client,
+                "request",
+                side_effect=[
+                    {"cmode": "shell"},
+                    {
+                        "port": "5900",
+                        "ticket": "PVEVNC:ticket",
+                        "user": "automation@pve!mcp",
+                    },
+                ],
+            ) as request,
+            patch.object(
+                client, "_open_lxc_terminal_websocket", return_value=connection
+            ),
+            patch(
+                "proxmox_client.uuid.uuid4",
+                return_value=SimpleNamespace(hex=token),
+            ),
+        ):
+            result = client.lxc_console_exec("pve1", 101, "echo hello")
+
+        self.assertEqual(
+            request.call_args_list,
+            [
+                call("GET", "/nodes/pve1/lxc/101/config"),
+                call("POST", "/nodes/pve1/lxc/101/termproxy"),
+            ],
+        )
+        self.assertEqual(connection.sent[0], b"automation@pve!mcp:PVEVNC:ticket\n")
+        self.assertEqual(connection.sent[1], b"0:11:stty -echo\n")
+        self.assertTrue(connection.sent[2].startswith(b"0:"))
+        self.assertEqual(result.output, "hello")
+        self.assertEqual(result.exit_code, 7)
+        self.assertTrue(connection.closed)
+
+    def test_lxc_console_exec_rejects_unsafe_identifiers_before_request(self):
+        client = ProxmoxClient(self.settings, FakeSession(FakeResponse()))
+
+        with self.assertRaisesRegex(ProxmoxError, "node must"):
+            client.lxc_console_exec("pve1/../../other", 101, "id")
+
+    def test_lxc_console_exec_requires_complete_termproxy_data(self):
+        client = ProxmoxClient(self.settings, FakeSession(FakeResponse()))
+        with patch.object(
+            client, "request", side_effect=[{"cmode": "shell"}, {"port": 5900}]
+        ):
+            with self.assertRaisesRegex(ProxmoxError, "port, ticket, and user"):
+                client.lxc_console_exec("pve1", 101, "id")
+
+    def test_lxc_console_exec_rejects_login_console_before_termproxy(self):
+        client = ProxmoxClient(self.settings, FakeSession(FakeResponse()))
+        with patch.object(client, "request", return_value={}) as request:
+            with self.assertRaisesRegex(ProxmoxError, "cmode='shell'"):
+                client.lxc_console_exec("pve1", 101, "id")
+
+        request.assert_called_once_with("GET", "/nodes/pve1/lxc/101/config")
+
+    def test_lxc_websocket_url_encodes_ticket(self):
+        client = ProxmoxClient(self.settings, FakeSession(FakeResponse()))
+
+        url = client._lxc_websocket_url("pve1", 101, 5900, "PVEVNC:a+b/c==")
+
+        self.assertEqual(
+            url,
+            "wss://pve.example:8006/api2/json/nodes/pve1/lxc/101/"
+            "vncwebsocket?port=5900&vncticket=PVEVNC%3Aa%2Bb%2Fc%3D%3D",
+        )
+
+    def test_lxc_console_wrapper_quotes_single_quotes_without_base64(self):
+        token = "b" * 32
+        start = f"__PVE_MCP_START_{token}__"
+        done = f"__PVE_MCP_DONE_{token}__"
+        connection = FakeWebSocket(
+            [b"OK", f"{start}\r\nit's safe\r\n{done}:0\r\n".encode()]
+        )
+        client = ProxmoxClient(self.settings, FakeSession(FakeResponse()))
+
+        with (
+            patch.object(
+                client,
+                "request",
+                side_effect=[
+                    {"cmode": "shell"},
+                    {"port": 5900, "ticket": "ticket", "user": "root@pam"},
+                ],
+            ),
+            patch.object(
+                client, "_open_lxc_terminal_websocket", return_value=connection
+            ),
+            patch(
+                "proxmox_client.uuid.uuid4",
+                return_value=SimpleNamespace(hex=token),
+            ),
+        ):
+            result = client.lxc_console_exec("pve1", 101, "printf \"it's safe\"")
+
+        wrapper_frame = connection.sent[2].decode("utf-8")
+        self.assertIn("it'\"'\"'s safe", wrapper_frame)
+        self.assertNotIn("base64", wrapper_frame)
+        self.assertEqual(result.output, "it's safe")
 
 
 if __name__ == "__main__":

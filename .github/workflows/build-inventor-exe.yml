@@ -47,7 +47,7 @@ jobs:
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          python -m pip install "mcp[cli]" "fastmcp>=3,<4" requests beautifulsoup4 keyring pywin32 pyinstaller "pywebview>=5.4,<7"
+          python -m pip install "mcp[cli]" "fastmcp>=3,<4" requests websocket-client beautifulsoup4 keyring pywin32 pyinstaller "pywebview>=5.4,<7"
 
       - name: Validate sources
         shell: pwsh
@@ -156,7 +156,7 @@ jobs:
       - name: Install build dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install "mcp[cli]" "fastmcp>=3,<4" requests beautifulsoup4 keyring pyinstaller "pywebview>=5.4,<7"
+          python -m pip install "mcp[cli]" "fastmcp>=3,<4" requests websocket-client beautifulsoup4 keyring pyinstaller "pywebview>=5.4,<7"
 
       - name: Validate Linux MCP sources
         run: |
