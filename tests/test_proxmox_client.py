@@ -116,7 +116,10 @@ class ProxmoxClientTests(unittest.TestCase):
         connection = FakeWebSocket(
             [
                 b"OK",
-                f"root@ct:~# stty -echo\r\n{start}\r\nhello\r\n{done}:7\r\n".encode(),
+                b"echoed wrapper copy\r\n",
+                f"wrapped line\r\r\n{start}\r\r\n".encode(),
+                b"hello\r\r\n",
+                f"\r\r\n{done}:7\r\r\n".encode(),
             ]
         )
         client = ProxmoxClient(self.settings, FakeSession(FakeResponse()))
@@ -152,8 +155,9 @@ class ProxmoxClientTests(unittest.TestCase):
             ],
         )
         self.assertEqual(connection.sent[0], b"automation@pve!mcp:PVEVNC:ticket\n")
-        self.assertEqual(connection.sent[1], b"0:11:stty -echo\n")
+        self.assertEqual(connection.sent[1], b"1:1000:24:")
         self.assertTrue(connection.sent[2].startswith(b"0:"))
+        self.assertEqual(connection.timeouts, [0.25])
         self.assertEqual(result.output, "hello")
         self.assertEqual(result.exit_code, 7)
         self.assertTrue(connection.closed)
@@ -196,7 +200,7 @@ class ProxmoxClientTests(unittest.TestCase):
         start = f"__PVE_MCP_START_{token}__"
         done = f"__PVE_MCP_DONE_{token}__"
         connection = FakeWebSocket(
-            [b"OK", f"{start}\r\nit's safe\r\n{done}:0\r\n".encode()]
+            [b"OK", f"{start}\r\r\nit's safe\r\r\n{done}:0\r\r\n".encode()]
         )
         client = ProxmoxClient(self.settings, FakeSession(FakeResponse()))
 

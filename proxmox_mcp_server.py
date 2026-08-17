@@ -87,7 +87,7 @@ def pve_lxc_console_exec(
     node: str,
     vmid: int,
     command: str,
-    timeout_seconds: float = 15.0,
+    timeout_seconds: float | None = None,
     confirm: bool = False,
 ) -> dict[str, Any]:
     """Execute a shell command inside an LXC container through its console.
@@ -97,6 +97,8 @@ def pve_lxc_console_exec(
     explicit confirm=true after the exact node, VMID, and command were
     reviewed. Unlike QEMU guest-agent exec, console execution is terminal
     based; the returned exit code is captured by a shell completion marker.
+    It waits until the command completes unless timeout_seconds is explicitly
+    set.
     """
     _require_confirmation("POST", confirm)
     result = _client().lxc_console_exec(

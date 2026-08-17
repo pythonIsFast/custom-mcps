@@ -314,7 +314,8 @@ Show me the exact command first and only continue with confirm=true after I appr
 
 LXC console execution uses Proxmox's xterm.js terminal protocol rather than a
 Guest Agent. It returns the captured terminal output and a shell-derived exit
-code. It times out after 15 seconds by default (configurable up to 300 seconds).
+code. By default it waits until the command completes; set `timeout_seconds`
+only when a deliberate overall execution deadline is wanted.
 The target container must use console mode `shell`; Proxmox defaults to the
 login-based `tty` mode, which cannot safely execute an unattended command. Set
 it with `pct set <VMID> --cmode shell` or under the container's Options in the

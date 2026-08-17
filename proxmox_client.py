@@ -326,7 +326,9 @@ class ProxmoxClient:
     def _clean_terminal_output(raw_output: bytes) -> str:
         """Make terminal output readable without dropping normal Unicode."""
         text = raw_output.decode("utf-8", errors="replace")
-        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        # A Proxmox LXC PTY can produce CRCRLF (``\r\r\n``), not just the
+        # usual CRLF. Collapse any CR run before LF to one logical newline.
+        text = re.sub(r"\r+\n", "\n", text).replace("\r", "\n")
         text = _ANSI_ESCAPE_RE.sub("", text)
         text = "".join(
             character
@@ -340,8 +342,8 @@ class ProxmoxClient:
         node: str,
         vmid: int,
         command: str,
-        timeout_seconds: float,
-    ) -> tuple[str, int, str, float]:
+        timeout_seconds: float | None,
+    ) -> tuple[str, int, str, float | None]:
         node = str(node).strip()
         if not _NODE_NAME_RE.fullmatch(node):
             raise ProxmoxError(
@@ -363,13 +365,17 @@ class ProxmoxClient:
             raise ProxmoxError(
                 f"command exceeds the {MAX_CONSOLE_COMMAND_BYTES}-byte limit."
             )
+        if timeout_seconds is None:
+            return node, vmid, command, None
         if (
             isinstance(timeout_seconds, bool)
             or not isinstance(timeout_seconds, (int, float))
             or not math.isfinite(float(timeout_seconds))
-            or not 0.5 <= float(timeout_seconds) <= 300.0
+            or float(timeout_seconds) < 0.5
         ):
-            raise ProxmoxError("timeout_seconds must be between 0.5 and 300.")
+            raise ProxmoxError(
+                "timeout_seconds must be None or a finite number of at least 0.5."
+            )
         return node, vmid, command, float(timeout_seconds)
 
     def _lxc_websocket_url(
@@ -405,7 +411,7 @@ class ProxmoxClient:
         vmid: int,
         port: int,
         ticket: str,
-        timeout_seconds: float,
+        timeout_seconds: float | None,
     ) -> Any:
         if websocket is None:
             raise ProxmoxError(
@@ -417,9 +423,12 @@ class ProxmoxClient:
                 {"cert_reqs": ssl.CERT_NONE, "check_hostname": False}
             )
         try:
+            connect_timeout = self.settings.timeout_seconds
+            if timeout_seconds is not None:
+                connect_timeout = min(connect_timeout, timeout_seconds)
             return websocket.create_connection(
                 self._lxc_websocket_url(node, vmid, port, ticket),
-                timeout=min(timeout_seconds, self.settings.timeout_seconds),
+                timeout=connect_timeout,
                 header=[
                     "Authorization: "
                     f"PVEAPIToken={self.settings.token_id}={self.settings.token_secret}"
@@ -447,7 +456,7 @@ class ProxmoxClient:
         node: str,
         vmid: int,
         command: str,
-        timeout_seconds: float = 15.0,
+        timeout_seconds: float | None = None,
     ) -> LxcConsoleResult:
         """Execute one shell command through an LXC xterm.js console.
 
@@ -455,7 +464,9 @@ class ProxmoxClient:
         This method therefore creates a short-lived termproxy, authenticates
         its WebSocket protocol, and runs the command through ``/bin/sh``.
         Completion is detected with a random marker assembled from two shell
-        strings, preventing the terminal's command echo from matching it.
+        strings, preventing the terminal's command echo from matching it. By
+        default it waits for that marker without a total execution deadline;
+        pass ``timeout_seconds`` to impose one deliberately.
         """
         node, vmid, command, timeout_seconds = self._validate_lxc_console_arguments(
             node, vmid, command, timeout_seconds
@@ -477,7 +488,9 @@ class ProxmoxClient:
             raise ProxmoxError("Proxmox returned invalid termproxy connection data.")
 
         started_at = time.monotonic()
-        deadline = started_at + timeout_seconds
+        deadline = (
+            started_at + timeout_seconds if timeout_seconds is not None else None
+        )
         connection = self._open_lxc_terminal_websocket(
             node, vmid, port, ticket, timeout_seconds
         )
@@ -494,16 +507,16 @@ class ProxmoxClient:
         wrapped_command = (
             f"printf '%s%s\\n' '{start_first}' '{start_second}'; "
             f"/bin/sh -c {quoted_command}; "
-            "__pve_mcp_rc=$?; stty echo; "
+            "__pve_mcp_rc=$?; "
             f"printf '\\n%s%s:%s\\n' '{marker_first}' '{marker_second}' "
             '"$__pve_mcp_rc"\n'
         )
         output = bytearray()
         marker_pattern = re.compile(
-            re.escape(marker).encode("ascii") + rb":(-?\d+)(?:\r?\n|$)"
+            re.escape(marker).encode("ascii") + rb":(-?\d+)(?:\r*\n|$)"
         )
         start_pattern = re.compile(
-            re.escape(start_marker).encode("ascii") + rb"(?:\r?\n|$)"
+            re.escape(start_marker).encode("ascii") + rb"(?:\r*\n|$)"
         )
 
         try:
@@ -515,13 +528,26 @@ class ProxmoxClient:
                 )
             authenticated = True
 
-            # Disable local terminal echo so the encoded wrapper and command
-            # are not mixed into the returned command output.
-            connection.send_binary(self._terminal_input_frame("stty -echo\n"))
-            connection.send_binary(self._terminal_input_frame(wrapped_command))
-            connection.settimeout(min(0.25, timeout_seconds))
+            # A wide PTY keeps echoed wrapper text readable in timeout errors.
+            # It is not required for marker detection: real marker output is
+            # shorter than a normal terminal line and parsing tolerates the
+            # PTY's CRCRLF line endings.
+            connection.send_binary(b"1:1000:24:")
 
-            while time.monotonic() < deadline:
+            # Note: this LXC console is a genuine interactive PTY (the same
+            # kind pve-xtermjs itself talks to). Its terminal driver echoes
+            # whatever it receives back on the wire; that echo cannot be
+            # reliably suppressed (an earlier attempt at sending 'stty -echo'
+            # first only added another echoed line and did not fix anything).
+            # Instead of fighting the echo, we send the command once and
+            # scan for the LAST occurrence of each marker: the real,
+            # executed 'printf' output is always the final occurrence in the
+            # stream, after any echoed copies of the input itself.
+            connection.send_binary(self._terminal_input_frame(wrapped_command))
+            # This is a per-recv poll interval, not an execution deadline.
+            connection.settimeout(0.25)
+
+            while deadline is None or time.monotonic() < deadline:
                 try:
                     message = connection.recv()
                 except Exception as exc:
@@ -543,14 +569,23 @@ class ProxmoxClient:
                         f"LXC console output exceeded the "
                         f"{MAX_CONSOLE_OUTPUT_BYTES}-byte safety limit."
                     )
-                match = marker_pattern.search(output)
-                if match:
-                    start_match = start_pattern.search(output)
-                    if start_match is None or start_match.end() > match.start():
+                # Take the LAST match of each marker, not the first: the PTY
+                # may echo the input (and therefore the marker text embedded
+                # in it) one or more times before the command is actually
+                # executed by the shell. Only the final occurrence reflects
+                # real execution.
+                matches = list(marker_pattern.finditer(output))
+                if matches:
+                    match = matches[-1]
+                    start_matches = list(
+                        start_pattern.finditer(output, 0, match.start())
+                    )
+                    if not start_matches:
                         raise ProxmoxError(
                             "The LXC console returned a completion marker without "
                             "the expected command-start marker."
                         )
+                    start_match = start_matches[-1]
                     clean_output = self._clean_terminal_output(
                         output[start_match.end() : match.start()]
                     )
@@ -564,6 +599,9 @@ class ProxmoxClient:
                         duration_seconds=round(time.monotonic() - started_at, 3),
                     )
 
+            # Reaching this branch is only possible when the caller explicitly
+            # requested a total timeout.
+            assert timeout_seconds is not None
             partial_output = self._clean_terminal_output(bytes(output))
             detail = (
                 f" Partial output: {partial_output[:500]}"
@@ -577,7 +615,10 @@ class ProxmoxClient:
         finally:
             if authenticated and not completed:
                 try:
-                    connection.send_binary(self._terminal_input_frame("\x03stty echo\n"))
+                    # Send Ctrl+C to interrupt a still-running command before
+                    # closing, so a timed-out call does not leave a runaway
+                    # process behind in the container.
+                    connection.send_binary(self._terminal_input_frame("\x03"))
                 except Exception:
                     pass
             try:
