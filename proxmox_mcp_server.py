@@ -44,8 +44,15 @@ def _require_confirmation(method: str, confirm: bool) -> None:
 
 @mcp.tool()
 def pve_api_schema(path: str = "/") -> Any:
-    """Return the live Proxmox API schema for a path, including valid child endpoints and parameters."""
-    return _client().request("GET", path, query={"schema": 1})
+    """Inspect a live Proxmox API path without invoking an unsupported schema query.
+
+    For directory paths, Proxmox returns the available child endpoints. For
+    resource paths, it returns the same read-only data as a normal GET request.
+    Proxmox's JSON API does not expose method parameter schemas through
+    ``?schema=1``; use the returned paths and the official API viewer before
+    constructing mutating requests.
+    """
+    return _client().request("GET", path)
 
 
 @mcp.tool()
@@ -58,7 +65,7 @@ def pve_request(
 ) -> Any:
     """Call any Proxmox VE API endpoint.
 
-    Use pve_api_schema first when parameters are unknown. All non-read-only
+    Use pve_api_schema first to inspect available child paths. All non-read-only
     methods require confirm=true, including POST, PUT, PATCH, and DELETE.
     """
     _require_confirmation(method, confirm)

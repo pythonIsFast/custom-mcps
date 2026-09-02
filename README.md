@@ -159,6 +159,7 @@ The Moodle server signs in through Moodle's regular login page and keeps an auth
 - Create courses
 - Rename, move, show, hide, duplicate, and delete course content
 - Create and update pages, URLs, labels, folders, forums, assignments, resources, and basic quizzes
+- Create, inspect, export, upload, and edit interactive H5P activities and `.h5p` packages
 - Upload files to Moodle's draft area
 - Inspect internal Moodle forms and call AJAX-enabled functions
 - Retry automatically after an expired session
@@ -224,6 +225,42 @@ Create a hidden five-section course called "Python Basics".
 Add a page named "Welcome" to section 1 with a short introduction.
 ```
 
+### H5P workflow
+
+The Moodle MCP works with Moodle's native `mod_h5pactivity` package field. It
+can publish an existing `.h5p` package, inspect its `h5p.json`,
+`content/content.json`, library semantics and file list, export it again, and
+replace its content or settings.
+
+Relevant tools:
+
+- `moodle_h5p_inspect` — inspect a Base64 package or an existing activity
+- `moodle_create_h5p_activity` — upload and publish an interactive H5P activity
+- `moodle_update_h5p_activity` — replace its package/content or edit settings
+- `moodle_h5p_export` — return the complete package as Base64
+
+For reliable AI-authored content, first inspect an existing activity of the
+same H5P content type. Then use it as `template_cmid`: the MCP preserves its
+libraries and assets while replacing `h5p.json` and/or
+`content/content.json`. A package can also be built without a template, but
+its required H5P libraries must already be installed in Moodle or included in
+`files_base64_json`. Package paths and JSON are validated locally before the
+upload; Moodle remains authoritative for library compatibility and content
+validation.
+
+Example requests:
+
+```text
+Inspect H5P activity 87, keep its question type and design, replace the
+questions with five questions about networking, and publish the result in
+section 2 of course 42.
+```
+
+```text
+Update only the content of H5P activity 87 and keep its libraries, media,
+display settings, and title unchanged.
+```
+
 > [!WARNING]
 > If an OS keyring is unavailable, the current implementation falls back to storing the Moodle password in a local configuration file. Install `keyring` and check the storage location reported during setup.
 
@@ -235,13 +272,14 @@ Add a page named "Welcome" to section 1 with a short introduction.
 The Proxmox VE server exposes the live JSON API behind a small set of MCP
 tools. `pve_request` can call every HTTP endpoint available to the configured
 API token, so the MCP does not become stale when Proxmox adds an endpoint. Use
-`pve_api_schema` to inspect paths and accepted parameters directly on the
-connected PVE instance.
+`pve_api_schema` to inspect live API paths directly on the connected PVE
+instance. For directory paths, it lists the child endpoints available to the
+configured token.
 
 ### Features
 
 - Call every Proxmox VE JSON API endpoint with `pve_request`
-- Inspect the live API tree and endpoint parameter schemas
+- Inspect the live API tree and child endpoints
 - Upload files through multipart API endpoints
 - List cluster resources and guests with concise convenience tools
 - Start, stop, reboot, suspend, and resume QEMU VMs and LXC containers
@@ -304,7 +342,7 @@ Start VM 100 on pve1 using pve_guest_action with confirm=true, wait for its task
 ```
 
 ```text
-Use pve_request to create a snapshot for container 200. Inspect the endpoint schema first and ask me for confirmation before sending the request.
+Use pve_request to create a snapshot for container 200. Inspect the API path first and ask me for confirmation before sending the request.
 ```
 
 ```text

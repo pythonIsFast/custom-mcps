@@ -76,14 +76,14 @@ class ProxmoxServerTests(unittest.TestCase):
             ],
         )
 
-    def test_schema_request_uses_the_live_schema_query_parameter(self):
+    def test_schema_request_inspects_path_without_unsupported_query_parameter(self):
         client = FakeClient()
         with patch.object(server, "_client", return_value=client):
             server.pve_api_schema("/nodes/pve1/qemu")
 
         self.assertEqual(
             client.calls,
-            [("GET", "/nodes/pve1/qemu", {"query": {"schema": 1}})],
+            [("GET", "/nodes/pve1/qemu", {})],
         )
 
     def test_lxc_console_exec_requires_explicit_confirmation(self):

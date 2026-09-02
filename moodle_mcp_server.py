@@ -67,18 +67,25 @@ GRENZEN
 - Der AJAX-Endpoint stellt nur ajax-freigeschaltete Funktionen bereit.
   core_course_get_contents, core_course_get_categories und
   core_webservice_get_site_info antworten mit 'servicenotavailable'.
-- Aktivitaeten/Inhalte ANLEGEN ist noch nicht enthalten (laeuft ueber
-  /course/modedit.php, braucht pro Modultyp eigene Felder).
-- Nicht offiziell dokumentiert: kann bei Moodle-Updates brechen.
+- Aktivitaeten und H5P-Pakete werden ueber normale Moodle-Formulare sowie
+  den Repository-Upload angelegt; dafuer sind passende Kursrechte noetig.
+- Nicht offiziell dokumentierte interne Endpunkte koennen bei Moodle-Updates
+  Anpassungen erfordern.
 """
 
+import base64
+import html
+import io
 import json
+import mimetypes
 import os
 import re
 import subprocess
 import sys
 import time
+import zipfile
 from pathlib import Path
+from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
@@ -995,9 +1002,36 @@ class MoodleSession:
             "html_laenge": len(r.text),
         }
 
+    @staticmethod
+    def _context_id_from_html(html: str):
+        """Liest Moodles aktuelle Kontext-ID aus JS-Konfiguration/body-Klasse."""
+        patterns = (
+            r'"contextid"\s*:\s*(\d+)',
+            r'M\.cfg\.contextid\s*=\s*(\d+)',
+            r'\bcontext-(\d+)\b',
+            r'data-contextid=["\'](\d+)["\']',
+        )
+        for pattern in patterns:
+            match = re.search(pattern, html)
+            if match:
+                return int(match.group(1))
+        return None
+
+    def context_id(self, url_or_path: str, params: dict = None) -> int:
+        """Ermittelt die Moodle-Kontext-ID einer Seite fuer Datei-Uploads."""
+        url = self._resolve_url(url_or_path)
+        response = self.s.get(url, params=params or {}, timeout=30)
+        response.raise_for_status()
+        context_id = self._context_id_from_html(response.text)
+        if context_id is None:
+            raise RuntimeError(f"Keine Moodle-Kontext-ID auf {response.url} gefunden.")
+        return context_id
+
     def upload_draft_file(self, filename: str, content_bytes: bytes,
                           course_context_id: int = None,
-                          repo_id_hint: int = None):
+                          repo_id_hint: int = None,
+                          draft_itemid: int = None,
+                          content_type: str = None):
         """
         Laedt eine Datei in den eigenen Draft-Bereich und gibt die
         draft_itemid zurueck, die anschliessend als extra_fields={'files':
@@ -1022,11 +1056,13 @@ class MoodleSession:
 
         ctx = course_context_id or 1
         letzter_fehler = None
+        content_type = (content_type or mimetypes.guess_type(filename)[0]
+                        or "application/octet-stream")
 
         for repo_id in kandidaten:
-            itemid = int(time.time() * 1000) % (2**31)
-            files = {"repo_upload_file": (filename, content_bytes,
-                                          "application/octet-stream")}
+            itemid = (int(draft_itemid) if draft_itemid is not None else
+                      int(time.time() * 1000) % (2**31))
+            files = {"repo_upload_file": (filename, content_bytes, content_type)}
             data = {
                 "itemid": str(itemid), "sesskey": self.sesskey,
                 "savepath": "/", "title": filename,
@@ -1057,6 +1093,181 @@ class MoodleSession:
             "ist deaktiviert, oder die ID liegt ausserhalb 1-20 - dann "
             "repo_id_hint mit einer hoeheren Zahl versuchen."
         )
+
+    @staticmethod
+    def inspect_h5p_package(package_bytes: bytes) -> dict:
+        """Prueft und beschreibt ein H5P-ZIP, ohne Bibliothekscode auszufuehren."""
+        if len(package_bytes) > 100 * 1024 * 1024:
+            raise ValueError("H5P-Paket ist groesser als 100 MiB.")
+        try:
+            archive = zipfile.ZipFile(io.BytesIO(package_bytes))
+        except zipfile.BadZipFile as exc:
+            raise ValueError("Die Datei ist kein gueltiges H5P/ZIP-Paket.") from exc
+
+        with archive:
+            infos = archive.infolist()
+            if len(infos) > 5000:
+                raise ValueError("H5P-Paket enthaelt mehr als 5000 Dateien.")
+            total_size = sum(info.file_size for info in infos)
+            if total_size > 500 * 1024 * 1024:
+                raise ValueError("Entpacktes H5P-Paket ist groesser als 500 MiB.")
+            names = []
+            for info in infos:
+                normalized = info.filename.replace("\\", "/")
+                parts = normalized.split("/")
+                if (normalized.startswith("/") or ".." in parts
+                        or re.match(r"^[A-Za-z]:", normalized)):
+                    raise ValueError(f"Unsicherer Pfad im H5P-Paket: {info.filename}")
+                if not info.is_dir():
+                    names.append(normalized)
+            missing = [name for name in ("h5p.json", "content/content.json")
+                       if name not in names]
+            if missing:
+                raise ValueError("Kein vollstaendiges H5P-Paket; fehlt: "
+                                 + ", ".join(missing))
+            try:
+                manifest = json.loads(archive.read("h5p.json").decode("utf-8"))
+                content = json.loads(
+                    archive.read("content/content.json").decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError(f"Ungueltiges JSON im H5P-Paket: {exc}") from exc
+
+            semantics = {}
+            for name in names:
+                if name.endswith("/semantics.json"):
+                    try:
+                        semantics[name] = json.loads(
+                            archive.read(name).decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        semantics[name] = {"fehler": "ungueltiges JSON"}
+            return {
+                "h5p": manifest,
+                "content": content,
+                "semantics": semantics,
+                "dateien": names,
+                "dateianzahl": len(names),
+                "gepackte_bytes": len(package_bytes),
+                "entpackte_bytes": total_size,
+            }
+
+    @classmethod
+    def build_h5p_package(cls, manifest: dict, content: dict,
+                          extra_files: dict = None,
+                          template_bytes: bytes = None) -> bytes:
+        """Baut ein H5P-Paket neu oder ersetzt JSON in einem Vorlagenpaket."""
+        if not isinstance(manifest, dict) or not isinstance(content, dict):
+            raise ValueError("h5p_json und content_json muessen JSON-Objekte sein.")
+        required = ("title", "language", "mainLibrary", "embedTypes",
+                    "preloadedDependencies")
+        missing = [field for field in required if field not in manifest]
+        if missing:
+            raise ValueError("In h5p_json fehlen Pflichtfelder: "
+                             + ", ".join(missing))
+        files = {}
+        if template_bytes is not None:
+            cls.inspect_h5p_package(template_bytes)
+            with zipfile.ZipFile(io.BytesIO(template_bytes)) as source:
+                for info in source.infolist():
+                    if not info.is_dir():
+                        files[info.filename.replace("\\", "/")] = source.read(info)
+        for name, value in (extra_files or {}).items():
+            normalized = name.replace("\\", "/")
+            if (normalized.startswith("/") or ".." in normalized.split("/")
+                    or re.match(r"^[A-Za-z]:", normalized)):
+                raise ValueError(f"Unsicherer H5P-Dateipfad: {name}")
+            if normalized in ("h5p.json", "content/content.json"):
+                raise ValueError(f"{normalized} muss ueber das JSON-Argument gesetzt werden.")
+            files[normalized] = value
+        files["h5p.json"] = json.dumps(
+            manifest, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        files["content/content.json"] = json.dumps(
+            content, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+
+        target = io.BytesIO()
+        with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as archive:
+            for name, value in files.items():
+                archive.writestr(name, value)
+        result = target.getvalue()
+        cls.inspect_h5p_package(result)
+        return result
+
+    def _h5p_package_url(self, cmid: int) -> str:
+        response = self.s.get(f"{self.base}/mod/h5pactivity/view.php",
+                              params={"id": int(cmid)}, timeout=30)
+        response.raise_for_status()
+        page = html.unescape(response.text).replace("\\/", "/")
+        matches = re.findall(
+            r'''(?:https?://[^"'<> ]+|/[^"'<> ]*pluginfile\.php[^"'<> ]*)''',
+            page,
+        )
+        for candidate in matches:
+            if ("pluginfile.php" in candidate
+                    and "/mod_h5pactivity/package/" in candidate):
+                return urljoin(self.base + "/", candidate.replace("&amp;", "&"))
+        raise RuntimeError(
+            "Keine H5P-Paket-URL gefunden. Download/Re-use kann in den "
+            "Aktivitaetseinstellungen deaktiviert oder der Zugriff verweigert sein."
+        )
+
+    def download_h5p_package(self, cmid: int) -> tuple:
+        url = self._h5p_package_url(cmid)
+        response = self.s.get(url, timeout=120)
+        response.raise_for_status()
+        content = response.content
+        details = self.inspect_h5p_package(content)
+        disposition = response.headers.get("Content-Disposition", "")
+        match = re.search(r'filename\*?=(?:UTF-8\'\')?["\']?([^"\';]+)',
+                          disposition, re.I)
+        filename = match.group(1) if match else f"h5p-activity-{cmid}.h5p"
+        return filename, content, details
+
+    def create_h5p_activity(self, course_id: int, section_number: int,
+                            name: str, package_bytes: bytes, intro: str = "",
+                            settings: dict = None,
+                            repo_id_hint: int = None):
+        self.inspect_h5p_package(package_bytes)
+        context_id = self.context_id("/course/modedit.php", {
+            "add": "h5pactivity", "course": int(course_id),
+            "section": int(section_number), "return": 0,
+        })
+        filename = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-.") or "activity"
+        filename += ".h5p"
+        uploaded = self.upload_draft_file(
+            filename, package_bytes, course_context_id=context_id,
+            repo_id_hint=repo_id_hint, content_type="application/zip")
+        fields = {"packagefile": uploaded["draft_itemid"]}
+        fields.update(settings or {})
+        result = self.create_activity(course_id, section_number, "h5pactivity",
+                                      name, intro, fields)
+        result["upload"] = uploaded
+        return result
+
+    def update_h5p_activity(self, cmid: int, package_bytes: bytes = None,
+                            name: str = None, intro: str = None,
+                            settings: dict = None,
+                            repo_id_hint: int = None):
+        fields = dict(settings or {})
+        if package_bytes is not None:
+            details = self.inspect_h5p_package(package_bytes)
+            edit_url = f"{self.base}/course/modedit.php"
+            response = self.s.get(edit_url, params={"update": int(cmid)}, timeout=30)
+            response.raise_for_status()
+            context_id = self._context_id_from_html(response.text)
+            if context_id is None:
+                raise RuntimeError("Keine Modul-Kontext-ID fuer den H5P-Upload gefunden.")
+            filename = re.sub(r"[^A-Za-z0-9._-]+", "-",
+                              (name or details["h5p"].get("title") or "activity"))
+            uploaded = self.upload_draft_file(
+                filename.strip("-.") + ".h5p", package_bytes,
+                course_context_id=context_id, repo_id_hint=repo_id_hint,
+                content_type="application/zip")
+            fields["packagefile"] = uploaded["draft_itemid"]
+        result = self.update_activity(cmid, name, intro, fields)
+        if package_bytes is not None:
+            result["upload"] = uploaded
+        return result
 
     def edit_module_action(self, cmid: int, action: str):
         """
@@ -1499,7 +1710,8 @@ def moodle_create_activity(course_id: int, section_number: int,
 
     activity_type: 'page', 'url', 'label', 'folder', 'forum', 'assign',
       'resource' (Datei - braucht vorher moodle_upload_file), 'quiz'
-      (nur Grundeinstellungen, keine Fragen).
+      (nur Grundeinstellungen, keine Fragen), 'h5pactivity' (fuer H5P besser
+      moodle_create_h5p_activity verwenden).
     section_number: die Abschnitts-NUMMER (0, 1, 2, ...), NICHT die
       section_id aus moodle_course_structure.
     extra_fields_json: typspezifische Pflicht-/Zusatzfelder als JSON, z.B.
@@ -1514,7 +1726,7 @@ def moodle_create_activity(course_id: int, section_number: int,
         return {"fehler": f"extra_fields_json ist kein gueltiges JSON: {e}"}
 
     bekannte_typen = {"page", "url", "label", "folder", "forum", "assign",
-                      "resource", "quiz"}
+                      "resource", "quiz", "h5pactivity"}
     if activity_type not in bekannte_typen:
         return {"fehler": f"Unbekannter/ungetesteter Typ '{activity_type}'. "
                           f"Gegen diese Instanz geprueft: {sorted(bekannte_typen)}. "
@@ -1578,6 +1790,163 @@ def moodle_upload_file(filename: str, content_base64: str,
                 "hinweis": "Upload-Mechanismus unverifiziert - ggf. mit "
                            "DevTools einen echten Datei-Upload im Browser "
                            "beobachten und Feldnamen abgleichen."}
+
+
+def _decode_h5p_inputs(package_base64: str = "", h5p_json: str = "",
+                       content_json: str = "", files_base64_json: str = "{}",
+                       template_cmid: int = None) -> bytes:
+    """Dekodiert MCP-Argumente und baut bei Bedarf ein H5P-Paket."""
+    if package_base64:
+        try:
+            package = base64.b64decode(package_base64, validate=True)
+        except Exception as exc:
+            raise ValueError(f"package_base64 ist kein gueltiges Base64: {exc}") from exc
+        MoodleSession.inspect_h5p_package(package)
+        return package
+    template = None
+    template_details = None
+    if template_cmid is not None:
+        _, template, template_details = with_retry(
+            lambda session: session.download_h5p_package(template_cmid))
+    if not h5p_json and template_details is not None:
+        manifest = template_details["h5p"]
+    elif h5p_json:
+        try:
+            manifest = json.loads(h5p_json)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Ungueltiges h5p_json: {exc}") from exc
+    else:
+        raise ValueError("package_base64 oder h5p_json ist erforderlich.")
+    if not content_json and template_details is not None:
+        content = template_details["content"]
+    elif content_json:
+        try:
+            content = json.loads(content_json)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Ungueltiges content_json: {exc}") from exc
+    else:
+        raise ValueError("package_base64 oder content_json ist erforderlich.")
+    try:
+        encoded_files = json.loads(files_base64_json or "{}")
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Ungueltiges files_base64_json: {exc}") from exc
+    if not isinstance(encoded_files, dict):
+        raise ValueError("files_base64_json muss ein Objekt Pfad -> Base64 sein.")
+    files = {}
+    for name, encoded in encoded_files.items():
+        try:
+            files[name] = base64.b64decode(encoded, validate=True)
+        except Exception as exc:
+            raise ValueError(f"Ungueltiges Base64 fuer '{name}': {exc}") from exc
+    return MoodleSession.build_h5p_package(manifest, content, files, template)
+
+
+@mcp.tool()
+def moodle_h5p_inspect(package_base64: str = "", cmid: int = None) -> dict:
+    """Liest Manifest, Inhalt, Bibliotheks-Schemata und Dateiliste eines H5P.
+
+    Entweder package_base64 oder cmid einer vorhandenen H5P-Aktivitaet angeben.
+    Das Werkzeug fuehrt keinen JavaScript-/PHP-Code aus. Die enthaltenen
+    semantics.json-Dateien helfen der KI, gueltige Inhalte fuer den jeweiligen
+    H5P-Inhaltstyp zu erstellen oder zu bearbeiten.
+    """
+    try:
+        if package_base64:
+            package = base64.b64decode(package_base64, validate=True)
+            return MoodleSession.inspect_h5p_package(package)
+        if cmid is None:
+            return {"fehler": "package_base64 oder cmid ist erforderlich."}
+        filename, _, details = with_retry(
+            lambda session: session.download_h5p_package(cmid))
+        details["dateiname"] = filename
+        details["cmid"] = cmid
+        return details
+    except Exception as exc:
+        return {"fehler": str(exc)}
+
+
+@mcp.tool()
+def moodle_h5p_export(cmid: int) -> dict:
+    """Exportiert das vollstaendige .h5p-Paket einer Moodle-H5P-Aktivitaet.
+
+    Die Rueckgabe enthaelt Base64 und kann bei grossen Videos/Bildern sehr gross
+    werden. Fuer reines Lesen oder Bearbeiten ist moodle_h5p_inspect effizienter.
+    """
+    try:
+        filename, package, details = with_retry(
+            lambda session: session.download_h5p_package(cmid))
+        return {"dateiname": filename,
+                "content_base64": base64.b64encode(package).decode("ascii"),
+                "gepackte_bytes": details["gepackte_bytes"]}
+    except Exception as exc:
+        return {"fehler": str(exc)}
+
+
+@mcp.tool()
+def moodle_create_h5p_activity(
+        course_id: int, section_number: int, name: str,
+        package_base64: str = "", h5p_json: str = "", content_json: str = "",
+        files_base64_json: str = "{}", template_cmid: int = None,
+        intro: str = "", settings_json: str = "{}",
+        repo_id_hint: int = None) -> dict:
+    """Erstellt eine interaktive Moodle-H5P-Aktivitaet.
+
+    Am sichersten ist ein komplettes .h5p als package_base64. Alternativ baut
+    der MCP ein Paket aus h5p_json, content_json und optionalen Dateien
+    (files_base64_json: H5P-Pfad -> Base64). Mit template_cmid werden alle
+    Bibliotheken/Assets einer vorhandenen Aktivitaet uebernommen und nur die
+    angegebenen JSON-Inhalte ersetzt. Ohne Vorlage muessen benoetigte
+    Bibliotheken bereits in Moodle installiert oder als Dateien enthalten sein.
+
+    settings_json kann H5P-Formularfelder wie enabletracking, grademethod,
+    reviewmode, grade[modgrade_type], grade[modgrade_point] und
+    displayopt[frame]/displayopt[download]/displayopt[embed]/displayopt[copyright]
+    setzen. Benoetigt Bearbeitungsrechte und das aktivierte H5P-Aktivitaetsmodul.
+    """
+    try:
+        package = _decode_h5p_inputs(
+            package_base64, h5p_json, content_json, files_base64_json,
+            template_cmid)
+        settings = json.loads(settings_json or "{}")
+        if not isinstance(settings, dict):
+            raise ValueError("settings_json muss ein JSON-Objekt sein.")
+        return with_retry(lambda session: session.create_h5p_activity(
+            course_id, section_number, name, package, intro, settings,
+            repo_id_hint))
+    except Exception as exc:
+        return {"fehler": str(exc)}
+
+
+@mcp.tool()
+def moodle_update_h5p_activity(
+        cmid: int, name: str = None, intro: str = None,
+        package_base64: str = "", h5p_json: str = "", content_json: str = "",
+        files_base64_json: str = "{}", settings_json: str = "{}",
+        repo_id_hint: int = None) -> dict:
+    """Bearbeitet Einstellungen und/oder Inhalt einer H5P-Aktivitaet.
+
+    package_base64 ersetzt das Paket vollstaendig. Werden h5p_json und/oder
+    content_json angegeben, dient die bestehende Aktivitaet automatisch als
+    Vorlage: Bibliotheken, Assets und das nicht angegebene JSON bleiben erhalten;
+    files_base64_json kann Assets hinzufuegen/ersetzen.
+    Ohne Paket-/JSON-Argument werden nur Name, Beschreibung und settings_json
+    geaendert. Vor einer strukturellen Inhaltsaenderung moodle_h5p_inspect(cmid)
+    nutzen, um Manifest, aktuellen Inhalt und semantics.json zu lesen.
+    """
+    try:
+        settings = json.loads(settings_json or "{}")
+        if not isinstance(settings, dict):
+            raise ValueError("settings_json muss ein JSON-Objekt sein.")
+        package = None
+        if package_base64 or h5p_json or content_json:
+            template_cmid = None if package_base64 else cmid
+            package = _decode_h5p_inputs(
+                package_base64, h5p_json, content_json, files_base64_json,
+                template_cmid)
+        return with_retry(lambda session: session.update_h5p_activity(
+            cmid, package, name, intro, settings, repo_id_hint))
+    except Exception as exc:
+        return {"fehler": str(exc)}
 
 
 @mcp.tool()
