@@ -151,7 +151,7 @@ jobs:
       - name: Install OS dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3-tk libgtk-3-dev gir1.2-webkit2-4.1
+          sudo apt-get install -y python3-tk python3-gi gir1.2-gtk-3.0 libgtk-3-dev gir1.2-webkit2-4.1
 
       - name: Install build dependencies
         run: |
@@ -187,6 +187,11 @@ jobs:
 
       - name: Build Linux manager executable
         run: |
+          # PyGObject (gi) is installed system-wide by apt and is tied to the
+          # system Python's dist-packages, not the actions/setup-python
+          # interpreter used for pip installs. Point PYTHONPATH at it so
+          # PyInstaller can discover and bundle gi and its typelibs.
+          export PYTHONPATH="/usr/lib/python3/dist-packages:${PYTHONPATH}"
           pyinstaller \
             --clean \
             --noconfirm \
@@ -194,6 +199,8 @@ jobs:
             --name custom-mcp-manager-linux-x64 \
             --add-data "installer_ui:installer_ui" \
             --collect-all webview \
+            --collect-all gi \
+            --collect-all cairo \
             installer_manager.py
 
       - name: Verify Linux executable
