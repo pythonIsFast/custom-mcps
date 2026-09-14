@@ -1642,13 +1642,17 @@
 
     async function boot() {
       setConnection(true, "Python bridge connected");
-      try {
-        addLog("Custom MCP Manager started.", "success");
-        await loadState();
-        await refreshRelease();
-      } catch (error) {
-        throw error;
-      }
+      addLog("Custom MCP Manager started.", "success");
+      await loadState();
+      // GitHub can be slow or unavailable. It must not keep the bridge in its
+      // startup state after local data is already usable.
+      setTimeout(() => {
+        refreshRelease().catch(error => {
+          addLog(`Release check failed: ${error}`, "error");
+          toast("Release check failed; local management remains available.", "error");
+          renderRelease();
+        });
+      }, 0);
     }
 
     window.addEventListener("pywebviewready", () => tryManagerBoot());

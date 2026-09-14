@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from hashlib import sha256
+from unittest.mock import patch
 from pathlib import Path
 
 from installer_manager import ManagerApi, SERVERS, server_asset
@@ -35,6 +36,29 @@ class InstallerManagerConfigTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def test_initial_state_skips_executable_hashing_before_release_is_loaded(self):
+        with patch("installer_manager.sha256_file") as digest:
+            state = self.api.get_state()
+
+        self.assertIsNone(state["release"])
+        digest.assert_not_called()
+
+    def test_repeated_state_uses_cached_executable_hashes(self):
+        self.api._release = {
+            "tag": "v1.2.1",
+            "assets": {
+                server_asset(spec): {"digest": "sha256:" + ("0" * 64)}
+                for spec in SERVERS.values()
+            },
+        }
+        with patch("installer_manager.sha256_file", return_value="1" * 64) as digest:
+            self.api.get_state()
+            first_count = digest.call_count
+            self.api.get_state()
+
+        self.assertEqual(first_count, len(SERVERS))
+        self.assertEqual(digest.call_count, first_count)
 
     def test_claude_merge_preserves_existing_servers(self):
         path = self.appdata / "Claude" / "claude_desktop_config.json"

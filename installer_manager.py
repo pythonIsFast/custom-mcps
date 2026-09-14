@@ -147,6 +147,7 @@ class ManagerApi:
         )
         self.window = None
         self._release: dict[str, Any] | None = None
+        self._digest_cache: dict[str, tuple[int, int, str]] = {}
         self._operation_lock = threading.Lock()
         self._diagnostic_lock = threading.Lock()
         self._write_diagnostic("Manager API initialized.")
@@ -226,6 +227,18 @@ class ManagerApi:
 
     # ------------------------------------------------------------- State/read API
 
+    def _cached_sha256(self, path: Path) -> str:
+        """Hash an executable only when its size or modification time changed."""
+        stat = path.stat()
+        key = str(path.resolve())
+        signature = (stat.st_size, stat.st_mtime_ns)
+        cached = self._digest_cache.get(key)
+        if cached and cached[:2] == signature:
+            return cached[2]
+        digest = sha256_file(path)
+        self._digest_cache[key] = (*signature, digest)
+        return digest
+
     def get_state(self) -> dict[str, Any]:
         metadata = self._load_metadata()
         servers = {}
@@ -233,11 +246,16 @@ class ManagerApi:
             asset_name = server_asset(spec)
             path = self.bin_dir / asset_name
             installed = path.exists()
-            local_digest = sha256_file(path) if installed else None
             release_asset = (self._release or {}).get("assets", {}).get(
                 asset_name, {}
             )
             available_digest = self._digest_value(release_asset.get("digest"))
+            # Before the asynchronous release check there is nothing to compare
+            # against, so avoid hashing every large executable during bridge boot.
+            local_digest = (
+                self._cached_sha256(path)
+                if installed and available_digest else None
+            )
             installed_tag = metadata.get(server_id, {}).get("release_tag")
             available_tag = (self._release or {}).get("tag")
             if installed and local_digest and available_digest:
@@ -284,7 +302,7 @@ class ManagerApi:
 
     def refresh_release(self) -> dict[str, Any]:
         try:
-            response = self.session.get(RELEASE_API, timeout=30)
+            response = self.session.get(RELEASE_API, timeout=(3.05, 10))
             response.raise_for_status()
             raw = response.json()
             assets = {}
