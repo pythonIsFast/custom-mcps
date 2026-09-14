@@ -1010,6 +1010,13 @@
           </div>
           <div class="config-row">
             <div>
+              <div class="config-title">WebUntis login setup</div>
+              <div class="config-description">Opens the secure terminal setup for the installed WebUntis server.</div>
+            </div>
+            <button class="button" onclick="runUntisSetup()">Open setup</button>
+          </div>
+          <div class="config-row">
+            <div>
               <div class="config-title">Proxmox VE token setup</div>
               <div class="config-description">Tests an API token without storing it. Configure its environment variables in your MCP client afterwards.</div>
             </div>
@@ -1161,7 +1168,7 @@
 
     function serverCard(server, mode) {
       const p = app.progress[server.id] || { percent: 0, status: "Ready" };
-      const icon = server.id === "inventor" ? "I" : server.id === "moodle" ? "M" : "P";
+      const icon = { inventor: "I", moodle: "M", proxmox: "P", untis: "U" }[server.id] || "?";
       const installed = Boolean(server.installed);
       const supported = server.supported !== false;
       const label = server.update_available
@@ -1171,9 +1178,12 @@
           : !supported ? "Not available on this platform" : installed ? "Installed" : "Not installed";
       const badgeClass = server.update_available ? "update" : installed ? "installed" : "";
       const action = installed ? (server.update_available ? "Update now" : "Reinstall") : "Install";
-      const secondary = server.id === "moodle" && installed
-        ? `<button class="button small" onclick="runMoodleSetup()">Login setup</button>`
-        : "";
+      const secondary = !installed ? ""
+        : server.id === "moodle"
+          ? `<button class="button small" onclick="runMoodleSetup()">Login setup</button>`
+          : server.id === "untis"
+            ? `<button class="button small" onclick="runUntisSetup()">Login setup</button>`
+            : "";
       const uninstall = installed
         ? `<button class="button danger small" onclick="uninstallServer('${server.id}')" ${app.busy ? "disabled" : ""}>Uninstall</button>`
         : "";
@@ -1549,6 +1559,12 @@
     async function runMoodleSetup() {
       const result = await window.pywebview.api.run_moodle_setup();
       if (result.ok) toast("Moodle setup opened in a new terminal.", "success");
+      else toast(result.error, "error");
+    }
+
+    async function runUntisSetup() {
+      const result = await window.pywebview.api.run_untis_setup();
+      if (result.ok) toast("WebUntis setup opened in a new terminal.", "success");
       else toast(result.error, "error");
     }
 

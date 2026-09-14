@@ -26,8 +26,10 @@ class InstallerManagerConfigTests(unittest.TestCase):
             "inventor-mcp-server.exe",
             "moodle-mcp-server.exe",
             "proxmox-mcp-server.exe",
+            "untis-mcp-server.exe",
             "moodle-mcp-server-linux-x64",
             "proxmox-mcp-server-linux-x64",
+            "untis-mcp-server-linux-x64",
         ):
             (self.api.bin_dir / spec).write_bytes(b"test executable")
 
@@ -59,6 +61,17 @@ class InstallerManagerConfigTests(unittest.TestCase):
         self.assertIn("custom_moodle", data["mcpServers"])
         self.assertEqual(len(result["backups"]), 1)
         self.assertTrue(Path(result["backups"][0]).exists())
+
+    def test_untis_server_can_be_added_to_client_configuration(self):
+        path = self.appdata / "Claude" / "claude_desktop_config.json"
+
+        result = self.api.configure_clients(["claude"], ["untis"])
+
+        self.assertTrue(result["ok"])
+        data = json.loads(path.read_text(encoding="utf-8"))
+        self.assertIn("custom_untis", data["mcpServers"])
+        self.assertIn(server_asset(SERVERS["untis"]),
+                      data["mcpServers"]["custom_untis"]["command"])
 
     def test_vscode_uses_servers_root_and_stdio_type(self):
         result = self.api.configure_clients(["vscode"], ["inventor", "proxmox"])

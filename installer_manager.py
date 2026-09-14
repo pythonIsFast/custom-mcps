@@ -65,6 +65,13 @@ SERVERS = {
         "linux_asset": "proxmox-mcp-server-linux-x64",
         "config_name": "custom_proxmox",
     },
+    "untis": {
+        "name": "WebUntis MCP",
+        "description": "Read and manage WebUntis through an authenticated browser session.",
+        "asset": "untis-mcp-server.exe",
+        "linux_asset": "untis-mcp-server-linux-x64",
+        "config_name": "custom_untis",
+    },
 }
 
 
@@ -1143,6 +1150,21 @@ class ManagerApi:
         executable = self.bin_dir / server_asset(SERVERS["moodle"])
         if not executable.exists():
             return {"ok": False, "error": "Install Moodle MCP first."}
+        try:
+            subprocess.Popen(
+                [str(executable), "--setup"],
+                creationflags=(
+                    subprocess.CREATE_NEW_CONSOLE if sys.platform == "win32" else 0
+                ),
+            )
+            return {"ok": True}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def run_untis_setup(self) -> dict[str, Any]:
+        executable = self.bin_dir / server_asset(SERVERS["untis"])
+        if not executable.exists():
+            return {"ok": False, "error": "Install WebUntis MCP first."}
         try:
             subprocess.Popen(
                 [str(executable), "--setup"],

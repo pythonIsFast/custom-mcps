@@ -1,6 +1,6 @@
 name: Build and release MCP executables
 
-# Produces portable Windows x64 executables plus a Linux Moodle binary and publishes a release.
+# Produces portable Windows x64 executables plus Linux server binaries and publishes a release.
 on:
   workflow_dispatch:
   push:
@@ -11,6 +11,8 @@ on:
       - moodle_mcp_server.py
       - proxmox_mcp_server.py
       - proxmox_client.py
+      - untis_mcp_server.py
+      - untis_client.py
       - installer_manager.py
       - installer_ui/**
       - tests/**
@@ -52,7 +54,7 @@ jobs:
       - name: Validate sources
         shell: pwsh
         run: |
-          python -m py_compile inventor_mcp_server.py moodle_mcp_server.py proxmox_client.py proxmox_mcp_server.py installer_manager.py
+          python -m py_compile inventor_mcp_server.py moodle_mcp_server.py proxmox_client.py proxmox_mcp_server.py untis_client.py untis_mcp_server.py installer_manager.py
           python -m unittest discover -s tests -v
 
       - name: Build Inventor executable
@@ -91,6 +93,19 @@ jobs:
             --copy-metadata fastmcp-slim `
             proxmox_mcp_server.py
 
+      - name: Build WebUntis executable
+        shell: pwsh
+        run: |
+          pyinstaller `
+            --clean `
+            --noconfirm `
+            --onefile `
+            --name untis-mcp-server `
+            --collect-submodules keyring.backends `
+            --copy-metadata fastmcp `
+            --copy-metadata fastmcp-slim `
+            untis_mcp_server.py
+
       - name: Build installer manager
         shell: pwsh
         run: |
@@ -113,6 +128,7 @@ jobs:
             "dist/inventor-mcp-server.exe",
             "dist/moodle-mcp-server.exe",
             "dist/proxmox-mcp-server.exe",
+            "dist/untis-mcp-server.exe",
             "dist/custom-mcp-manager.exe"
           )
           foreach ($path in $artifacts) {
@@ -129,6 +145,7 @@ jobs:
             dist/inventor-mcp-server.exe
             dist/moodle-mcp-server.exe
             dist/proxmox-mcp-server.exe
+            dist/untis-mcp-server.exe
             dist/custom-mcp-manager.exe
           if-no-files-found: error
           retention-days: 30
@@ -160,7 +177,7 @@ jobs:
 
       - name: Validate Linux MCP sources
         run: |
-          python -m py_compile moodle_mcp_server.py proxmox_client.py proxmox_mcp_server.py
+          python -m py_compile moodle_mcp_server.py proxmox_client.py proxmox_mcp_server.py untis_client.py untis_mcp_server.py
           python -m unittest discover -s tests -v
 
       - name: Build Linux Moodle executable
@@ -185,6 +202,18 @@ jobs:
             --copy-metadata fastmcp-slim \
             proxmox_mcp_server.py
 
+      - name: Build Linux WebUntis executable
+        run: |
+          pyinstaller \
+            --clean \
+            --noconfirm \
+            --onefile \
+            --name untis-mcp-server-linux-x64 \
+            --collect-submodules keyring.backends \
+            --copy-metadata fastmcp \
+            --copy-metadata fastmcp-slim \
+            untis_mcp_server.py
+
       - name: Build Linux manager executable
         run: |
           # PyGObject (gi) is installed system-wide by apt and is tied to the
@@ -205,8 +234,8 @@ jobs:
 
       - name: Verify Linux executable
         run: |
-          ls -lh dist/moodle-mcp-server-linux-x64 dist/proxmox-mcp-server-linux-x64 dist/custom-mcp-manager-linux-x64
-          sha256sum dist/moodle-mcp-server-linux-x64 dist/proxmox-mcp-server-linux-x64 dist/custom-mcp-manager-linux-x64
+          ls -lh dist/moodle-mcp-server-linux-x64 dist/proxmox-mcp-server-linux-x64 dist/untis-mcp-server-linux-x64 dist/custom-mcp-manager-linux-x64
+          sha256sum dist/moodle-mcp-server-linux-x64 dist/proxmox-mcp-server-linux-x64 dist/untis-mcp-server-linux-x64 dist/custom-mcp-manager-linux-x64
 
       - name: Upload Linux Moodle artifact
         uses: actions/upload-artifact@v4
@@ -215,6 +244,7 @@ jobs:
           path: |
             dist/moodle-mcp-server-linux-x64
             dist/proxmox-mcp-server-linux-x64
+            dist/untis-mcp-server-linux-x64
             dist/custom-mcp-manager-linux-x64
           if-no-files-found: error
           retention-days: 30
@@ -337,8 +367,10 @@ jobs:
           | **inventor-mcp-server.exe** | Autodesk Inventor MCP server |
           | **moodle-mcp-server.exe** | Moodle MCP server |
           | **proxmox-mcp-server.exe** | Proxmox VE MCP server |
+          | **untis-mcp-server.exe** | WebUntis MCP server |
           | **moodle-mcp-server-linux-x64** | Moodle MCP server for Linux x64 |
           | **proxmox-mcp-server-linux-x64** | Proxmox VE MCP server for Linux x64 |
+          | **untis-mcp-server-linux-x64** | WebUntis MCP server for Linux x64 |
           | **custom-mcp-manager-linux-x64** | Custom MCP Manager for Linux x64 |
           | **SHA256SUMS.txt** | SHA-256 checksums for all release assets |
 
@@ -364,9 +396,11 @@ jobs:
             "dist/inventor-mcp-server.exe" `
             "dist/moodle-mcp-server.exe" `
             "dist/proxmox-mcp-server.exe" `
+            "dist/untis-mcp-server.exe" `
             "dist/custom-mcp-manager.exe" `
             "dist/moodle-mcp-server-linux-x64" `
             "dist/proxmox-mcp-server-linux-x64" `
+            "dist/untis-mcp-server-linux-x64" `
             "dist/custom-mcp-manager-linux-x64" `
             "dist/SHA256SUMS.txt" `
             --target $env:GITHUB_SHA `

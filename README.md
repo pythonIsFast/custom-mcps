@@ -2,7 +2,7 @@
 
 [![Build and release MCP executables](https://github.com/pythonIsFast/custom-mcps/actions/workflows/build-inventor-exe.yml/badge.svg)](https://github.com/pythonIsFast/custom-mcps/actions/workflows/build-inventor-exe.yml)
 
-Three local Model Context Protocol servers for controlling **Autodesk Inventor**, managing **Moodle without Web Service tokens**, and operating **Proxmox VE** through its native API. Build CAD models through Inventor's COM API, work with Moodle courses through an authenticated browser-style session, or manage a Proxmox cluster with a scoped API token.
+Four local Model Context Protocol servers for controlling **Autodesk Inventor**, managing **Moodle without Web Service tokens**, working with **WebUntis**, and operating **Proxmox VE** through its native API. Build CAD models through Inventor's COM API, work with Moodle and WebUntis through authenticated browser-style sessions, or manage a Proxmox cluster with a scoped API token.
 
 > [!IMPORTANT]
 > This repository is experimental. Test write and delete operations on disposable Inventor documents and Moodle courses before using them with important data.
@@ -14,6 +14,7 @@ Three local Model Context Protocol servers for controlling **Autodesk Inventor**
 | [`inventor_mcp_server.py`](./inventor_mcp_server.py) | Controls Autodesk Inventor through its COM API | Windows |
 | [`moodle_mcp_server.py`](./moodle_mcp_server.py) | Manages Moodle through a normal login session, internal AJAX calls, and HTML forms | Windows, Linux, WSL |
 | [`proxmox_mcp_server.py`](./proxmox_mcp_server.py) | Exposes the complete Proxmox VE JSON API through a secure generic MCP interface | Windows, Linux, WSL |
+| [`untis_mcp_server.py`](./untis_mcp_server.py) | Reads and manages WebUntis through its browser login, REST API, and legacy JSON-RPC | Windows, Linux, WSL |
 | [`installer_manager.py`](./installer_manager.py) | Installs release builds and configures supported MCP clients through a local HTML UI | Windows, Linux |
 
 ## 🚀 Custom MCP Manager
@@ -34,7 +35,7 @@ application built with an HTML interface and a Python bridge.
 - Preserves unrelated client settings
 - Creates and restores timestamped configuration backups
 - Creates Desktop and Start Menu shortcuts
-- Opens secure terminal setup for Moodle and Proxmox VE
+- Opens secure terminal setup for Moodle, WebUntis, and Proxmox VE
 - Keeps an in-app activity log for troubleshooting
 
 Download `custom-mcp-manager.exe` on Windows or
@@ -266,6 +267,79 @@ display settings, and title unchanged.
 
 > [!CAUTION]
 > Generic AJAX and form tools are powerful and can change or delete Moodle data. Use a dedicated Moodle account with the minimum required permissions and test against a non-production course first.
+
+## 🏫 WebUntis MCP
+
+The WebUntis server signs in through the normal browser endpoint, exchanges the
+cookie session for WebUntis's short-lived REST token, and keeps both secrets
+inside the process. It discovers roles and permissions from the token and
+supports both the modern REST API and constrained legacy JSON-RPC calls.
+
+### Features
+
+- Read school years, the current user's timetable and selectable resources
+- Read incoming/sent messages, drafts, message details and unread status
+- Read exams, homework and absences
+- Diagnose tenant bootstrap data, menus, roles and API permissions
+- Call same-origin REST endpoints through `untis_rest`
+- Call validated legacy services through `untis_jsonrpc`
+- Require `confirm=true` for generic state-changing requests
+- Refresh expiring REST tokens automatically
+
+### Installation and authentication
+
+```bash
+python -m pip install "fastmcp>=3,<4" requests keyring
+python untis_mcp_server.py --setup
+```
+
+Alternatively configure:
+
+```text
+UNTIS_URL=https://school.webuntis.com
+UNTIS_SCHOOL=internal-school-name
+UNTIS_USER=your-username
+UNTIS_PASSWORD=your-password
+UNTIS_VERIFY_TLS=1
+UNTIS_TENANT_ID=optional-override
+```
+
+SSO, mandatory password changes and second-factor challenges must currently be
+completed in the browser. If no OS keyring is available, setup falls back to a
+user-private configuration file and prints a plaintext-storage warning.
+
+### Reconnaissance helper
+
+`untis_inspector.js` is a local, browser-console helper for investigating a
+specific school's WebUntis deployment. It
+records request paths, methods, field names/types, response schemas and form
+structure, but deliberately excludes cookies, header values, request values,
+response values and storage values.
+
+1. Open the WebUntis login page, open the browser DevTools **Console**, and
+   paste the complete contents of `untis_inspector.js`.
+2. Optionally run `__UNTIS_INSPECTOR__.clear()`, then sign in normally. The
+   sanitized request metadata survives the login-page navigation in session
+   storage. Paste the script again after the navigation and run
+   `__UNTIS_INSPECTOR__.download()` to save the JSON result.
+3. On the authenticated page, leave the inspector active while opening the
+   timetable, substitutions, absences, messages and other relevant workflows.
+   Only actions performed while the interceptor is active provide full method,
+   request-field and response-schema information.
+4. Review the exported JSON before sharing it. Do not perform destructive
+   actions merely for inspection. Use `__UNTIS_INSPECTOR__.stop()` to remove
+   the interceptors early.
+
+The helper does not capture WebSocket or Service-Worker traffic; such traffic
+must be inspected separately in DevTools. It is a reconnaissance tool only and
+does not send data to this repository or any third party. Findings extracted
+from the public frontend bundles are documented in
+[`UNTIS_API_NOTES.md`](./UNTIS_API_NOTES.md).
+
+> [!CAUTION]
+> WebUntis can contain minors' personal, attendance, and assessment data. Use a
+> least-privilege account, protect local credentials, and review every generic
+> write request before setting `confirm=true`.
 
 ## 🖥️ Proxmox VE MCP
 
