@@ -85,7 +85,7 @@ import sys
 import time
 import zipfile
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -343,7 +343,13 @@ class MoodleSession:
         self.s = requests.Session()
         self.s.verify = verify_tls
         self.s.headers.update({
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) MoodleMCP/1.0",
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/131.0 Safari/537.36"
+            ),
+            "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+                       "image/avif,image/webp,*/*;q=0.8"),
+            "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
         })
         if not verify_tls:
             requests.packages.urllib3.disable_warnings()
@@ -703,8 +709,9 @@ class MoodleSession:
             "saveanddisplay": "Save and display",
         })
 
-        resp = self.s.post(edit_url, data=data, timeout=60,
-                           headers={"Referer": r.url})
+        resp = self._post_form(
+            edit_url, data, r.url,
+            multipart=(form.get("enctype", "").lower() == "multipart/form-data"))
         resp.raise_for_status()
 
         m = re.search(r"/course/view\.php\?id=(\d+)", resp.url)
@@ -837,8 +844,9 @@ class MoodleSession:
         data.update(extra_fields)
         data["submitbutton"] = "Save and display"
 
-        resp = self.s.post(edit_url, data=data, timeout=60,
-                           headers={"Referer": edit_url})
+        resp = self._post_form(
+            edit_url, data, edit_url,
+            multipart=(form.get("enctype", "").lower() == "multipart/form-data"))
         resp.raise_for_status()
 
         m = re.search(r"/(?:mod/\w+/view|course/view)\.php\?id=(\d+)", resp.url)
@@ -890,8 +898,9 @@ class MoodleSession:
         data.update(extra_fields)
         data["submitbutton"] = "Save and display"
 
-        resp = self.s.post(edit_url, data=data, timeout=60,
-                           headers={"Referer": edit_url})
+        resp = self._post_form(
+            edit_url, data, edit_url,
+            multipart=(form.get("enctype", "").lower() == "multipart/form-data"))
         resp.raise_for_status()
 
         m = re.search(r"/(?:mod/\w+/view|course/view)\.php\?id=(\d+)", resp.url)
@@ -918,15 +927,90 @@ class MoodleSession:
     # Defaults laden, gezielt ueberschreiben, absenden. Nur Pfade auf der
     # eigenen Instanz erlaubt (kein SSRF auf fremde Hosts).
 
-    def _resolve_url(self, url_or_path: str) -> str:
-        if url_or_path.startswith("http://") or url_or_path.startswith("https://"):
-            if not url_or_path.startswith(self.base):
-                raise ValueError(
-                    f"URL '{url_or_path}' liegt ausserhalb dieser Moodle-"
-                    f"Instanz ({self.base}) - abgelehnt."
-                )
-            return url_or_path
-        return self.base.rstrip("/") + "/" + url_or_path.lstrip("/")
+    def _resolve_url(self, url_or_path: str, relative_to: str = None) -> str:
+        if relative_to is None and url_or_path.startswith("/"):
+            url = self.base + "/" + url_or_path.lstrip("/")
+        else:
+            url = urljoin(relative_to or self.base + "/", url_or_path)
+        base = urlparse(self.base)
+        target = urlparse(url)
+        if (target.scheme, target.netloc) != (base.scheme, base.netloc):
+            raise ValueError(
+                f"URL '{url_or_path}' liegt ausserhalb dieser Moodle-"
+                f"Instanz ({self.base}) - abgelehnt."
+            )
+        return url
+
+    @staticmethod
+    def _form_values(form, exclude_prefixes=(), include_submit=False):
+        """Liest erfolgreiche HTML-Formularfelder mit ihren aktuellen Werten."""
+        values = {}
+        for el in form.find_all(["input", "select", "textarea"]):
+            name = el.get("name")
+            if (not name or el.has_attr("disabled")
+                    or any(name.startswith(p) for p in exclude_prefixes)):
+                continue
+            if el.name == "input":
+                input_type = (el.get("type") or "text").lower()
+                if input_type in ("button", "image", "reset", "file"):
+                    continue
+                if input_type == "submit" and not include_submit:
+                    continue
+                if input_type in ("checkbox", "radio") and not el.has_attr("checked"):
+                    continue
+                value = el.get("value", "")
+            elif el.name == "select":
+                options = el.find_all("option", selected=True)
+                if not options:
+                    first = el.find("option")
+                    options = [first] if first else []
+                selected = [option.get("value", "") for option in options]
+                value = selected if el.has_attr("multiple") else (selected[0] if selected else "")
+            else:
+                value = el.get_text()
+            if name in values:
+                previous = values[name]
+                values[name] = (previous if isinstance(previous, list) else [previous]) + (
+                    value if isinstance(value, list) else [value])
+            else:
+                values[name] = value
+        return values
+
+    def _post_form(self, url: str, data: dict, referer: str = None,
+                   multipart: bool = False, timeout: int = 60):
+        """Sendet einen browsernahen Formular-POST, optional als Multipart."""
+        url = self._resolve_url(url, relative_to=referer)
+        referer = self._resolve_url(referer) if referer else url
+        origin = urlparse(self.base)
+        headers = {
+            "Referer": referer,
+            "Origin": f"{origin.scheme}://{origin.netloc}",
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Dest": "document",
+            "Upgrade-Insecure-Requests": "1",
+        }
+        if multipart:
+            # (None, value) erzeugt normale Multipart-Felder ohne Dateiinhalt.
+            fields = []
+            for name, value in data.items():
+                values = value if isinstance(value, list) else [value]
+                fields.extend((name, (None, "" if item is None else str(item)))
+                              for item in values)
+            response = self.s.post(
+                url, files=fields, timeout=timeout, headers=headers)
+        else:
+            response = self.s.post(
+                url, data=data, timeout=timeout, headers=headers)
+        if response.status_code == 404:
+            raise RuntimeError(
+                f"Formular-POST auf {url} antwortet mit HTTP 404. Der Request "
+                "enthielt browsernahe Origin/Referer/Sec-Fetch-Header und wurde "
+                f"als {'multipart/form-data' if multipart else 'urlencoded'} gesendet. "
+                "Wahrscheinlich blockiert eine serverseitige WAF-/Webserver-Regel "
+                "normale PHP-POSTs; bitte Server-Logs pruefen."
+            )
+        return response
 
     def fetch_form(self, url_or_path: str, params: dict = None,
                   form_selector: str = None, exclude_prefixes=()):
@@ -945,11 +1029,35 @@ class MoodleSession:
         r = self.s.get(url, params=params or {}, timeout=30)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
-        form = (soup.select_one(form_selector) if form_selector else None) \
-            or soup.find("form", id=re.compile(r"^mform1")) \
-            or soup.find("form")
+        forms = soup.find_all("form")
+        formulare = [
+            {
+                "index": index,
+                "id": candidate.get("id"),
+                "action": self._resolve_url(candidate.get("action") or r.url,
+                                             relative_to=r.url),
+                "method": candidate.get("method", "get").lower(),
+                "enctype": candidate.get("enctype", "application/x-www-form-urlencoded"),
+            }
+            for index, candidate in enumerate(forms)
+        ]
+        if form_selector:
+            try:
+                form = soup.select_one(form_selector)
+            except Exception as exc:
+                raise ValueError(f"Ungueltiger form_selector: {exc}") from exc
+            if form is None or form.name != "form":
+                raise RuntimeError(
+                    f"form_selector '{form_selector}' findet kein Formular auf {r.url}."
+                )
+        else:
+            form = soup.find("form", id=re.compile(r"^mform1"))
+            if form is None:
+                form = next((candidate for candidate in forms
+                             if not re.search(r"(?:^|/)editmode\.php(?:$|\?)",
+                                              candidate.get("action", ""))), None)
         if form is None:
-            raise RuntimeError(f"Kein Formular gefunden auf {r.url}")
+            raise RuntimeError(f"Kein Inhaltsformular gefunden auf {r.url}")
 
         felder = []
         for el in form.find_all(["input", "select", "textarea"]):
@@ -976,21 +1084,26 @@ class MoodleSession:
 
         return {
             "endgueltige_url": r.url,
-            "form_action": form.get("action"),
-            "form_method": form.get("method", "get"),
+            "form_action": self._resolve_url(form.get("action") or r.url,
+                                             relative_to=r.url),
+            "form_method": form.get("method", "get").lower(),
+            "form_enctype": form.get("enctype", "application/x-www-form-urlencoded"),
             "form_id": form.get("id"),
+            "formular_index": forms.index(form),
+            "formulare": formulare,
+            "werte": self._form_values(form, exclude_prefixes),
             "felder": felder,
         }
 
-    def submit_form(self, action_url: str, data: dict, referer: str = None):
+    def submit_form(self, action_url: str, data: dict, referer: str = None,
+                    multipart: bool = False):
         """
         Sendet Formulardaten per POST an eine beliebige Seite dieser
         Instanz. Gibt die Antwort-URL (fuer Redirect-Erkennung) sowie
         etwaige sichtbare Fehlertexte zurueck.
         """
-        url = self._resolve_url(action_url)
-        headers = {"Referer": referer or url}
-        r = self.s.post(url, data=data, timeout=60, headers=headers)
+        url = self._resolve_url(action_url, relative_to=referer)
+        r = self._post_form(url, data, referer, multipart=multipart)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
         errs = [e.get_text(strip=True) for e in
@@ -1001,6 +1114,143 @@ class MoodleSession:
             "fehlertexte": list(dict.fromkeys(errs))[:10],
             "html_laenge": len(r.text),
         }
+
+    def question_categories(self, course_id: int):
+        url = f"{self.base}/question/bank/importquestions/import.php"
+        response = self.s.get(url, params={"courseid": int(course_id)}, timeout=30)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, "html.parser")
+        form = (soup.find("form", id=re.compile(r"^mform1"))
+                or soup.find("form", action=re.compile(r"import\.php")))
+        if form is None:
+            raise RuntimeError("Kein Fragenimport-Formular gefunden.")
+        category = form.find("select", {"name": "category"})
+        categories = []
+        for option in category.find_all("option") if category else []:
+            value = option.get("value", "")
+            parts = value.split(",", 1)
+            categories.append({
+                "wert": value,
+                "kategorie_id": int(parts[0]) if parts[0].isdigit() else parts[0],
+                "kontext_id": (int(parts[1]) if len(parts) > 1 and parts[1].isdigit()
+                               else (parts[1] if len(parts) > 1 else None)),
+                "name": option.get_text(" ", strip=True),
+                "ausgewaehlt": option.has_attr("selected"),
+            })
+        formats = []
+        for field in form.select('input[name="format"]'):
+            label = form.find("label", attrs={"for": field.get("id")})
+            formats.append({"wert": field.get("value", ""),
+                            "name": label.get_text(" ", strip=True) if label else "",
+                            "ausgewaehlt": field.has_attr("checked")})
+        return {"kurs_id": int(course_id), "kategorien": categories,
+                "importformate": formats, "url": response.url}
+
+    def import_questions(self, course_id: int, category: str, filename: str,
+                         content_bytes: bytes, file_format: str = "xml",
+                         match_grades: str = "error", stop_on_error: bool = False,
+                         repo_id_hint: int = None):
+        allowed = {"xml", "gift", "aiken", "multianswer", "missingword",
+                   "blackboard_six"}
+        if file_format not in allowed:
+            raise ValueError(f"Unbekanntes Importformat '{file_format}'.")
+        url = f"{self.base}/question/bank/importquestions/import.php"
+        response = self.s.get(url, params={"courseid": int(course_id)}, timeout=30)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, "html.parser")
+        form = (soup.find("form", id=re.compile(r"^mform1"))
+                or soup.find("form", action=re.compile(r"import\.php")))
+        if form is None:
+            raise RuntimeError("Kein Fragenimport-Formular gefunden.")
+        context_id = self._context_id_from_html(response.text)
+        if context_id is None:
+            raise RuntimeError("Keine Kontext-ID fuer den Fragenimport gefunden.")
+        file_field = form.find(attrs={"name": "newfile"})
+        draft_itemid = file_field.get("value") if file_field else None
+        uploaded = self.upload_draft_file(
+            filename, content_bytes, course_context_id=context_id,
+            repo_id_hint=repo_id_hint,
+            draft_itemid=int(draft_itemid) if str(draft_itemid or "").isdigit() else None)
+        data = self._form_values(form)
+        data.update({
+            "courseid": str(course_id), "format": file_format,
+            "category": str(category), "catfromfile": "1",
+            "contextfromfile": "1", "matchgrades": match_grades,
+            "stoponerror": "1" if stop_on_error else "0",
+            "newfile": str(uploaded["draft_itemid"]), "submitbutton": "Import",
+        })
+        action = self._resolve_url(form.get("action") or response.url,
+                                   relative_to=response.url)
+        result = self.submit_form(action, data, response.url, multipart=True)
+        result["upload"] = uploaded
+        return result
+
+    def list_questions(self, category_id: int, context_id: int,
+                       include_subcategories: bool = False,
+                       limit: int = 100, offset: int = 0):
+        if not 1 <= int(limit) <= 100:
+            raise ValueError("limit muss zwischen 1 und 100 liegen.")
+        data = self.ajax("core_question_get_random_question_summaries", {
+            "categoryid": int(category_id),
+            "includesubcategories": bool(include_subcategories),
+            "tagids": [], "contextid": int(context_id),
+            "limit": int(limit), "offset": int(offset),
+        })
+        questions = data.get("questions", []) if isinstance(data, dict) else []
+        return {
+            "fragen": [{key: question.get(key) for key in
+                        ("id", "name", "qtype", "category")}
+                       for question in questions if isinstance(question, dict)],
+            "gesamt": data.get("totalcount") if isinstance(data, dict) else None,
+            "limit": int(limit), "offset": int(offset),
+        }
+
+    def quiz_structure(self, cmid: int):
+        url = f"{self.base}/mod/quiz/edit.php"
+        response = self.s.get(url, params={"cmid": int(cmid)}, timeout=30)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, "html.parser")
+        slots = []
+        for slot in soup.select("li.slot"):
+            slot_number = slot.get("data-slot") or slot.get("data-slotnumber")
+            if slot_number is None:
+                match = re.search(r"(?:slot|slot-)(\d+)", " ".join(slot.get("class", [])))
+                slot_number = match.group(1) if match else None
+            link = slot.select_one('a[href*="question.php"], a[href*="previewquestion"]')
+            query = parse_qs(urlparse(link.get("href", "")).query) if link else {}
+            question_id = next((query[key][0] for key in ("id", "questionid", "q")
+                                if query.get(key)), None)
+            mark = slot.select_one(".mod_quiz_summarks, [data-region=maxmark]")
+            if mark and mark.name == "input":
+                max_mark = mark.get("value")
+            else:
+                max_mark = mark.get_text(" ", strip=True) if mark else None
+            name_node = slot.select_one(".questionname, .question_name") or link
+            slots.append({
+                "slot": int(slot_number) if str(slot_number or "").isdigit() else slot_number,
+                "frage_id": int(question_id) if str(question_id or "").isdigit() else question_id,
+                "name": name_node.get_text(" ", strip=True) if name_node else "",
+                "punkte": max_mark,
+                "seitentrenner_danach": bool(slot.select_one(".page_split_join")),
+            })
+        return {"cmid": int(cmid), "slots": slots, "anzahl": len(slots),
+                "url": response.url}
+
+    def quiz_add_questions(self, cmid: int, question_ids, page: int = 0):
+        if not question_ids:
+            raise ValueError("Mindestens eine frage_id ist erforderlich.")
+        results = []
+        for question_id in question_ids:
+            response = self.s.get(f"{self.base}/mod/quiz/edit.php", params={
+                "cmid": int(cmid), "addquestion": int(question_id),
+                "sesskey": self.sesskey, "addonpage": int(page),
+            }, timeout=30)
+            response.raise_for_status()
+            if "/login/" in response.url:
+                raise RuntimeError("Session beim Hinzufuegen der Quizfrage abgelaufen.")
+            results.append({"frage_id": int(question_id), "antwort_url": response.url})
+        return {"cmid": int(cmid), "hinzugefuegt": results,
+                "struktur": self.quiz_structure(cmid)}
 
     @staticmethod
     def _context_id_from_html(html: str):
@@ -1267,6 +1517,85 @@ class MoodleSession:
         result = self.update_activity(cmid, name, intro, fields)
         if package_bytes is not None:
             result["upload"] = uploaded
+        return result
+
+    def create_hvp_activity(self, course_id: int, section_number: int,
+                            name: str, package_bytes: bytes, intro: str = "",
+                            settings: dict = None, repo_id_hint: int = None):
+        """Erstellt eine Aktivitaet des Drittanbieter-Moduls mod_hvp."""
+        self.inspect_h5p_package(package_bytes)
+        query = {"add": "hvp", "course": int(course_id),
+                 "section": int(section_number), "return": 0, "sr": 0}
+        response = self.s.get(f"{self.base}/course/modedit.php",
+                              params=query, timeout=30)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, "html.parser")
+        form = (soup.find("form", id=re.compile(r"^mform1"))
+                or soup.find("form", action=re.compile(r"modedit\.php")))
+        if form is None:
+            raise RuntimeError("Kein mod_hvp-Anlegeformular gefunden; ist mod_hvp installiert?")
+        data = self._form_values(form)
+        context_id = self._context_id_from_html(response.text)
+        if context_id is None:
+            raise RuntimeError("Keine Kontext-ID fuer den mod_hvp-Upload gefunden.")
+        current_itemid = data.get("h5pfile")
+        filename = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-.") + ".h5p"
+        uploaded = self.upload_draft_file(
+            filename or "activity.h5p", package_bytes,
+            course_context_id=context_id, repo_id_hint=repo_id_hint,
+            draft_itemid=(int(current_itemid)
+                          if str(current_itemid or "").isdigit() else None),
+            content_type="application/zip")
+        data.update({
+            "name": name, "h5paction": "upload",
+            "h5pfile": str(uploaded["draft_itemid"]), "h5plibrary": "0",
+            "introeditor[text]": intro, "introeditor[format]": "1",
+            "submitbutton2": "Speichern und zum Kurs",
+        })
+        data.update(settings or {})
+        action = self._resolve_url(form.get("action") or response.url,
+                                   relative_to=response.url)
+        result = self.submit_form(action, data, response.url, multipart=True)
+        result["upload"] = uploaded
+        return result
+
+    def update_hvp_package(self, cmid: int, package_bytes: bytes,
+                           name: str = None, settings: dict = None,
+                           repo_id_hint: int = None):
+        """Ersetzt das Paket einer mod_hvp-Aktivitaet mit einem Vollformular-POST."""
+        self.inspect_h5p_package(package_bytes)
+        response = self.s.get(f"{self.base}/course/modedit.php",
+                              params={"update": int(cmid)}, timeout=30)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, "html.parser")
+        form = (soup.find("form", id=re.compile(r"^mform1"))
+                or soup.find("form", action=re.compile(r"modedit\.php")))
+        if form is None or not form.find(attrs={"name": "h5pparams"}):
+            raise RuntimeError("Kein mod_hvp-Bearbeitungsformular gefunden.")
+        # Absichtlich alle aktuellen Felder einschliesslich h5pparams erhalten.
+        data = self._form_values(form)
+        context_id = self._context_id_from_html(response.text)
+        if context_id is None:
+            raise RuntimeError("Keine Kontext-ID fuer den mod_hvp-Upload gefunden.")
+        current_itemid = data.get("h5pfile")
+        package_name = name or data.get("name") or "activity"
+        filename = re.sub(r"[^A-Za-z0-9._-]+", "-", package_name).strip("-.") + ".h5p"
+        uploaded = self.upload_draft_file(
+            filename or "activity.h5p", package_bytes,
+            course_context_id=context_id, repo_id_hint=repo_id_hint,
+            draft_itemid=(int(current_itemid)
+                          if str(current_itemid or "").isdigit() else None),
+            content_type="application/zip")
+        data.update({"h5paction": "upload",
+                     "h5pfile": str(uploaded["draft_itemid"]),
+                     "submitbutton2": "Speichern und zum Kurs"})
+        if name is not None:
+            data["name"] = name
+        data.update(settings or {})
+        action = self._resolve_url(form.get("action") or response.url,
+                                   relative_to=response.url)
+        result = self.submit_form(action, data, response.url, multipart=True)
+        result["upload"] = uploaded
         return result
 
     def edit_module_action(self, cmid: int, action: str):
@@ -2007,13 +2336,134 @@ def moodle_raw_ajax(methodname: str, args_json: str = "{}") -> dict:
 
 
 @mcp.tool()
+def moodle_question_categories(course_id: int) -> dict:
+    """Listet Fragenkategorien und verfuegbare Importformate eines Kurses.
+
+    Der Wert 'wert' einer Kategorie (z.B. '12,34') kann direkt als category
+    an moodle_import_questions uebergeben werden.
+    """
+    try:
+        return with_retry(lambda s: s.question_categories(course_id))
+    except Exception as exc:
+        return {"fehler": str(exc)}
+
+
+@mcp.tool()
+def moodle_import_questions(
+        course_id: int, category: str, filename: str, content_base64: str,
+        file_format: str = "xml", match_grades: str = "error",
+        stop_on_error: bool = False, repo_id_hint: int = None) -> dict:
+    """Importiert Fragen aus einer XML-, GIFT- oder Aiken-Datei.
+
+    category ist der zusammengesetzte Wert aus moodle_question_categories.
+    content_base64 enthaelt die Importdatei. Der Upload und das vollstaendige
+    Multipart-Importformular werden automatisch verarbeitet.
+    """
+    try:
+        content = base64.b64decode(content_base64, validate=True)
+        if not content:
+            raise ValueError("Die Importdatei ist leer.")
+        return with_retry(lambda s: s.import_questions(
+            course_id, category, filename, content, file_format,
+            match_grades, stop_on_error, repo_id_hint))
+    except Exception as exc:
+        return {"fehler": str(exc)}
+
+
+@mcp.tool()
+def moodle_list_questions(category_id: int, context_id: int,
+                          include_subcategories: bool = False,
+                          limit: int = 100, offset: int = 0) -> dict:
+    """Listet Fragen einer Fragenkategorie ueber Moodles AJAX-Endpunkt.
+
+    category_id und context_id stehen getrennt in der Ausgabe von
+    moodle_question_categories. Die Ausgabe ist mit limit/offset paginierbar.
+    """
+    try:
+        return with_retry(lambda s: s.list_questions(
+            category_id, context_id, include_subcategories, limit, offset))
+    except Exception as exc:
+        return {"fehler": str(exc)}
+
+
+@mcp.tool()
+def moodle_quiz_structure(cmid: int) -> dict:
+    """Liest Slots, Fragen-IDs, Namen und Punkte eines Quiz aus dessen Editierseite."""
+    try:
+        return with_retry(lambda s: s.quiz_structure(cmid))
+    except Exception as exc:
+        return {"fehler": str(exc)}
+
+
+@mcp.tool()
+def moodle_quiz_add_questions(cmid: int, question_ids_json: str,
+                              page: int = 0) -> dict:
+    """Fuegt vorhandene Fragen einem Quiz hinzu.
+
+    question_ids_json ist eine JSON-Liste von Fragen-IDs, z.B. '[12, 13]'.
+    page ist die nullbasierte Zielseite im Quiz.
+    """
+    try:
+        question_ids = json.loads(question_ids_json)
+        if not isinstance(question_ids, list):
+            raise ValueError("question_ids_json muss eine JSON-Liste sein.")
+        return with_retry(lambda s: s.quiz_add_questions(cmid, question_ids, page))
+    except Exception as exc:
+        return {"fehler": str(exc)}
+
+
+@mcp.tool()
+def moodle_create_hvp_activity(
+        course_id: int, section_number: int, name: str, package_base64: str,
+        intro: str = "", settings_json: str = "{}",
+        repo_id_hint: int = None) -> dict:
+    """Erstellt eine H5P-Aktivitaet mit dem Drittanbieter-Modul mod_hvp.
+
+    package_base64 muss ein vollstaendiges .h5p-Paket enthalten. Dieses Werkzeug
+    ist von moodle_create_h5p_activity (Moodle-Core-Modul h5pactivity) getrennt.
+    """
+    try:
+        package = base64.b64decode(package_base64, validate=True)
+        settings = json.loads(settings_json or "{}")
+        if not isinstance(settings, dict):
+            raise ValueError("settings_json muss ein JSON-Objekt sein.")
+        return with_retry(lambda s: s.create_hvp_activity(
+            course_id, section_number, name, package, intro, settings,
+            repo_id_hint))
+    except Exception as exc:
+        return {"fehler": str(exc)}
+
+
+@mcp.tool()
+def moodle_update_hvp_package(
+        cmid: int, package_base64: str, name: str = None,
+        settings_json: str = "{}", repo_id_hint: int = None) -> dict:
+    """Ersetzt das .h5p-Paket einer mod_hvp-Aktivitaet sicher.
+
+    Das Bearbeitungsformular wird zuerst vollstaendig geladen; insbesondere
+    h5pparams und nicht geaenderte Einstellungen werden beim POST erhalten.
+    """
+    try:
+        package = base64.b64decode(package_base64, validate=True)
+        settings = json.loads(settings_json or "{}")
+        if not isinstance(settings, dict):
+            raise ValueError("settings_json muss ein JSON-Objekt sein.")
+        return with_retry(lambda s: s.update_hvp_package(
+            cmid, package, name, settings, repo_id_hint))
+    except Exception as exc:
+        return {"fehler": str(exc)}
+
+
+@mcp.tool()
 def moodle_fetch_form(url_or_path: str, params_json: str = "{}",
                       form_selector: str = None,
                       exclude_prefixes_json: str = "[]") -> dict:
     """Laedt eine beliebige Seite dieser Moodle-Instanz und liest das
     Formular aus (Feldnamen, Typen, aktuelle Werte, Optionen,
-    Pflichtfelder). Zum Erforschen von Formularen, fuer die es noch kein
-    eigenes Werkzeug gibt (z.B. Fragenbank, Einschreibung, Kategorien).
+    Pflichtfelder). Die Ausgabe 'formulare' listet zusaetzlich alle Formulare
+    mit Index, ID und Action auf. Ohne Selektor wird das Moodle-mform bevorzugt
+    und der Bearbeitungsmodus-Schalter uebersprungen; ein nicht treffender
+    Selektor liefert einen Fehler statt still auf ein anderes Formular zu fallen.
 
     url_or_path: absoluter Pfad oder volle URL auf dieser Instanz, z.B.
       '/question/edit.php' oder '/user/index.php'.
@@ -2036,7 +2486,7 @@ def moodle_fetch_form(url_or_path: str, params_json: str = "{}",
 
 @mcp.tool()
 def moodle_submit_form(action_url: str, data_json: str,
-                       referer: str = None) -> dict:
+                       referer: str = None, multipart: bool = False) -> dict:
     """Sendet Formulardaten per POST an eine beliebige Seite dieser
     Moodle-Instanz. Nur Pfade auf der eigenen Instanz erlaubt.
 
@@ -2044,13 +2494,15 @@ def moodle_submit_form(action_url: str, data_json: str,
     data_json: alle Formularfelder als JSON-Objekt, typischerweise die
       Werte aus moodle_fetch_form uebernommen und gezielt ueberschrieben.
     referer: optional, meist die zuvor mit moodle_fetch_form geladene URL.
+    multipart: fuer Formulare mit enctype='multipart/form-data' auf true setzen.
     """
     try:
         data = json.loads(data_json)
     except ValueError as e:
         return {"fehler": f"data_json ist kein gueltiges JSON: {e}"}
     try:
-        return with_retry(lambda s: s.submit_form(action_url, data, referer))
+        return with_retry(lambda s: s.submit_form(
+            action_url, data, referer, multipart))
     except Exception as e:
         return {"fehler": str(e)}
 

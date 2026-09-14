@@ -159,10 +159,12 @@ The Moodle server signs in through Moodle's regular login page and keeps an auth
 - Inspect course sections and activities
 - Create courses
 - Rename, move, show, hide, duplicate, and delete course content
-- Create and update pages, URLs, labels, folders, forums, assignments, resources, and basic quizzes
+- Create and update pages, URLs, labels, folders, forums, assignments, resources, and quizzes
+- List question categories, import question files, browse the question bank, and manage quiz slots
 - Create, inspect, export, upload, and edit interactive H5P activities and `.h5p` packages
+- Support both Moodle's native `mod_h5pactivity` and the third-party `mod_hvp` module
 - Upload files to Moodle's draft area
-- Inspect internal Moodle forms and call AJAX-enabled functions
+- Inspect all forms on a page and submit browser-like URL-encoded or multipart forms
 - Retry automatically after an expired session
 
 ### Requirements
@@ -228,7 +230,8 @@ Add a page named "Welcome" to section 1 with a short introduction.
 
 ### H5P workflow
 
-The Moodle MCP works with Moodle's native `mod_h5pactivity` package field. It
+The Moodle MCP works with Moodle's native `mod_h5pactivity` package field and
+can also upload packages through the third-party `mod_hvp` activity module. It
 can publish an existing `.h5p` package, inspect its `h5p.json`,
 `content/content.json`, library semantics and file list, export it again, and
 replace its content or settings.
@@ -239,6 +242,8 @@ Relevant tools:
 - `moodle_create_h5p_activity` — upload and publish an interactive H5P activity
 - `moodle_update_h5p_activity` — replace its package/content or edit settings
 - `moodle_h5p_export` — return the complete package as Base64
+- `moodle_create_hvp_activity` — publish a package through third-party `mod_hvp`
+- `moodle_update_hvp_package` — safely replace a `mod_hvp` package while preserving form data
 
 For reliable AI-authored content, first inspect an existing activity of the
 same H5P content type. Then use it as `template_cmid`: the MCP preserves its
