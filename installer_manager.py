@@ -15,6 +15,7 @@ The application intentionally:
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import os
@@ -25,9 +26,10 @@ import sys
 import threading
 import time
 import tomllib
+import traceback
 import webbrowser
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar
 
 import requests
 
@@ -42,6 +44,15 @@ REPOSITORY = "pythonIsFast/custom-mcps"
 RELEASE_API = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
 RELEASE_PAGE = f"https://github.com/{REPOSITORY}/releases/latest"
 USER_AGENT = "CustomMCPManager/1.0"
+
+# Connect/read timeouts per socket operation, plus an overall deadline for a
+# single download. A stalled connection must never keep the UI busy forever.
+HTTP_CONNECT_TIMEOUT = 10
+HTTP_READ_TIMEOUT = 30
+DOWNLOAD_DEADLINE_SECONDS = 15 * 60
+PROGRESS_MIN_INTERVAL = 0.2
+
+F = TypeVar("F", bound=Callable[..., Any])
 
 SERVERS = {
     "inventor": {
@@ -100,6 +111,28 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def bridge_safe(method: F) -> F:
+    """Turn unexpected exceptions into ``{"ok": False, "error": ...}``.
+
+    pywebview delivers exceptions to the HTML page as rejected promises. Without
+    this guard a single unexpected error leaves the UI waiting on a call that
+    never reports back. The traceback goes to manager.log for diagnosis.
+    """
+
+    @functools.wraps(method)
+    def wrapper(self, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return method(self, *args, **kwargs)
+        except Exception as exc:
+            detail = traceback.format_exc()
+            self._write_diagnostic(f"Unhandled error in {method.__name__}:\n{detail}")
+            message = f"{method.__name__} failed: {exc}"
+            self._log(message, "error")
+            return {"ok": False, "error": message}
+
+    return wrapper  # type: ignore[return-value]
 
 
 class ManagerApi:
@@ -302,7 +335,9 @@ class ManagerApi:
 
     def refresh_release(self) -> dict[str, Any]:
         try:
-            response = self.session.get(RELEASE_API, timeout=(3.05, 10))
+            response = self.session.get(
+                RELEASE_API, timeout=(HTTP_CONNECT_TIMEOUT, HTTP_READ_TIMEOUT)
+            )
             response.raise_for_status()
             raw = response.json()
             assets = {}
@@ -396,6 +431,19 @@ class ManagerApi:
             self._operation_lock.release()
 
     def _install_server_locked(self, server_id: str) -> dict[str, Any]:
+        """Install one server. Never raises; every failure becomes a result dict."""
+        try:
+            return self._install_server_impl(server_id)
+        except Exception as exc:
+            detail = traceback.format_exc()
+            self._write_diagnostic(f"Install of {server_id} crashed:\n{detail}")
+            name = SERVERS.get(server_id, {}).get("name", server_id)
+            message = f"Installation failed for {name}: {exc}"
+            self._emit("progress", server=server_id, percent=0, status="Failed")
+            self._log(message, "error")
+            return {"ok": False, "error": message}
+
+    def _install_server_impl(self, server_id: str) -> dict[str, Any]:
         spec = SERVERS[server_id]
         if self._release is None:
             release_result = self.refresh_release()
@@ -447,18 +495,32 @@ class ManagerApi:
             digest = hashlib.sha256()
             downloaded = 0
 
+            deadline = time.monotonic() + DOWNLOAD_DEADLINE_SECONDS
+            last_emit = 0.0
             with self.session.get(
-                asset["download_url"], stream=True, timeout=(30, 180)
+                asset["download_url"],
+                stream=True,
+                timeout=(HTTP_CONNECT_TIMEOUT, HTTP_READ_TIMEOUT),
             ) as response:
                 response.raise_for_status()
                 total = int(response.headers.get("content-length") or asset["size"] or 0)
                 with temp_path.open("wb") as handle:
                     for chunk in response.iter_content(chunk_size=1024 * 256):
+                        if time.monotonic() > deadline:
+                            raise TimeoutError(
+                                "The download took too long and was cancelled."
+                            )
                         if not chunk:
                             continue
                         handle.write(chunk)
                         digest.update(chunk)
                         downloaded += len(chunk)
+                        # Throttle: each emit is a synchronous call into the
+                        # WebView, so emitting per chunk slows large downloads.
+                        now = time.monotonic()
+                        if now - last_emit < PROGRESS_MIN_INTERVAL and downloaded < total:
+                            continue
+                        last_emit = now
                         percent = int(downloaded * 100 / total) if total else 0
                         self._emit(
                             "progress",
@@ -1208,6 +1270,32 @@ class ManagerApi:
             return {"ok": True}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
+
+
+for _public_method in (
+    "get_state",
+    "refresh_release",
+    "install_server",
+    "install_all",
+    "uninstall_server",
+    "configure_clients",
+    "remove_client_entries",
+    "list_backups",
+    "restore_backup",
+    "choose_install_directory",
+    "set_install_directory",
+    "create_shortcuts",
+    "open_install_folder",
+    "open_release_page",
+    "run_moodle_setup",
+    "run_untis_setup",
+    "run_proxmox_setup",
+):
+    setattr(
+        ManagerApi,
+        _public_method,
+        bridge_safe(getattr(ManagerApi, _public_method)),
+    )
 
 
 def main() -> None:

@@ -276,6 +276,77 @@ class InstallerManagerConfigTests(unittest.TestCase):
         )
         self.assertEqual(reloaded.install_dir, new_install.resolve())
 
+    def test_unexpected_error_becomes_failed_result_not_exception(self):
+        with patch.object(
+            ManagerApi, "_client_states", side_effect=RuntimeError("boom")
+        ):
+            state = self.api.get_state()
+
+        self.assertFalse(state["ok"])
+        self.assertIn("boom", state["error"])
+        log = (self.settings / "manager.log").read_text(encoding="utf-8")
+        self.assertIn("Unhandled error in get_state", log)
+
+    def test_install_failure_before_download_returns_error_result(self):
+        self.api._release = {
+            "tag": "v1.3.0",
+            "assets": {
+                server_asset(SERVERS["moodle"]): {
+                    "digest": None,
+                    "size": 1,
+                    "download_url": "https://example.invalid/moodle",
+                }
+            },
+        }
+        target = self.api.bin_dir / server_asset(SERVERS["moodle"])
+        target.write_bytes(b"old")
+
+        with patch("installer_manager.sha256_file", side_effect=PermissionError("locked")):
+            with patch.object(self.api, "_digest_value", return_value="0" * 64):
+                result = self.api.install_server("moodle")
+
+        self.assertFalse(result["ok"])
+        self.assertIn("locked", result["error"])
+        self.assertFalse(self.api._operation_lock.locked())
+
+    def test_download_deadline_cancels_and_cleans_up(self):
+        payload_chunks = [b"x" * 16, b"y" * 16]
+
+        class FakeResponse:
+            headers = {"content-length": "32"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def raise_for_status(self):
+                return None
+
+            def iter_content(self, chunk_size):
+                yield from payload_chunks
+
+        self.api._release = {
+            "tag": "v1.3.0",
+            "assets": {
+                server_asset(SERVERS["moodle"]): {
+                    "digest": None,
+                    "size": 32,
+                    "download_url": "https://example.invalid/moodle",
+                }
+            },
+        }
+        self.api.session = type("S", (), {"get": lambda *a, **k: FakeResponse()})()
+        with patch("installer_manager.DOWNLOAD_DEADLINE_SECONDS", -1):
+            result = self.api.install_server("moodle")
+
+        self.assertFalse(result["ok"])
+        self.assertIn("too long", result["error"])
+        self.assertFalse(
+            (self.api.bin_dir / (server_asset(SERVERS["moodle"]) + ".download")).exists()
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

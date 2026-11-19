@@ -1116,6 +1116,36 @@
     let bridgeTimeoutTimer = null;
     let bootState = "waiting";
 
+    // Every bridge call goes through this proxy. It never rejects and never
+    // waits forever: failures and timeouts come back as { ok: false, error },
+    // the same shape the Python side uses. Busy flags are therefore always reset.
+    const LONG_RUNNING_CALLS = new Set(["install_server", "install_all"]);
+    const CALL_TIMEOUT_MS = 60 * 1000;
+    const LONG_CALL_TIMEOUT_MS = 60 * 60 * 1000;
+
+    const api = new Proxy({}, {
+      get(_, name) {
+        return (...args) => {
+          const bridge = window.pywebview?.api;
+          if (!bridge || typeof bridge[name] !== "function") {
+            return Promise.resolve({ ok: false, error: "The Python bridge is not available." });
+          }
+          const timeoutMs = LONG_RUNNING_CALLS.has(name) ? LONG_CALL_TIMEOUT_MS : CALL_TIMEOUT_MS;
+          let timer = null;
+          const timeout = new Promise(resolve => {
+            timer = setTimeout(
+              () => resolve({ ok: false, error: `${String(name)} did not respond in time.` }),
+              timeoutMs
+            );
+          });
+          const call = Promise.resolve()
+            .then(() => bridge[name](...args))
+            .catch(error => ({ ok: false, error: String(error?.message || error) }));
+          return Promise.race([call, timeout]).finally(() => clearTimeout(timer));
+        };
+      }
+    });
+
     function escapeHtml(value) {
       return String(value ?? "")
         .replaceAll("&", "&amp;")
@@ -1392,8 +1422,16 @@
       }
     };
 
+    // Returns false instead of throwing, so callers that reset busy flags
+    // after awaiting it always reach their cleanup code.
     async function loadState() {
-      const state = await window.pywebview.api.get_state();
+      const state = await api.get_state();
+      if (!state || state.ok === false || !state.servers) {
+        const message = state?.error || "Could not read the manager state.";
+        addLog(message, "error");
+        toast(message, "error");
+        return false;
+      }
       app.state = state;
       app.release = state.release;
       if (!app.initialClientSelectionDone) {
@@ -1402,13 +1440,18 @@
           .forEach(client => app.selectedClients.add(client.id));
         app.initialClientSelectionDone = true;
       }
-      render();
+      try {
+        render();
+      } catch (error) {
+        addLog(`Rendering failed: ${error}`, "error");
+      }
+      return true;
     }
 
     async function refreshRelease() {
       document.getElementById("releaseName").textContent = "Checking…";
       document.getElementById("releaseMeta").textContent = "Connecting to GitHub Releases";
-      const result = await window.pywebview.api.refresh_release();
+      const result = await api.refresh_release();
       if (result.ok) {
         app.release = result.release;
         await loadState();
@@ -1422,7 +1465,7 @@
     async function installServer(id) {
       if (app.busy) return;
       setBusy(true);
-      const result = await window.pywebview.api.install_server(id);
+      const result = await api.install_server(id);
       if (result.ok) toast(`${app.state.servers[id].name} installed.`, "success");
       else toast(result.error || "Installation failed.", "error");
       await loadState();
@@ -1433,7 +1476,7 @@
       const name = app.state.servers[id].name;
       if (!confirm(`Uninstall ${name} MCP executable? Client configuration entries will remain until you remove them separately.`)) return;
       setBusy(true);
-      const result = await window.pywebview.api.uninstall_server(id);
+      const result = await api.uninstall_server(id);
       if (result.ok) toast(`${name} MCP was uninstalled.`, "success");
       else toast(result.error || "Uninstall failed.", "error");
       await loadState();
@@ -1443,7 +1486,7 @@
     async function installAll() {
       if (app.busy) return;
       setBusy(true);
-      const result = await window.pywebview.api.install_all();
+      const result = await api.install_all();
       if (result.ok) toast("All MCP servers are installed.", "success");
       else toast(result.error || "Installation failed.", "error");
       await loadState();
@@ -1460,7 +1503,7 @@
         return;
       }
       setBusy(true);
-      const result = await window.pywebview.api.configure_clients(
+      const result = await api.configure_clients(
         Array.from(app.selectedClients),
         Array.from(app.selectedServers)
       );
@@ -1481,7 +1524,7 @@
       }
       if (!confirm("Remove the selected Custom MCP entries from the selected clients? A backup is created before every change.")) return;
       setBusy(true);
-      const result = await window.pywebview.api.remove_client_entries(
+      const result = await api.remove_client_entries(
         Array.from(app.selectedClients),
         Array.from(app.selectedServers)
       );
@@ -1503,7 +1546,7 @@
       }
       if (!confirm(`Restore this ${backup.client_name} backup? The current configuration will receive a safety backup first.`)) return;
       setBusy(true);
-      const result = await window.pywebview.api.restore_backup(backup.client_id, backup.path);
+      const result = await api.restore_backup(backup.client_id, backup.path);
       if (result.ok) {
         toast(`${backup.client_name} configuration restored. Restart the client.`, "success");
         await loadState();
@@ -1514,7 +1557,7 @@
     }
 
     async function browseInstallDirectory() {
-      const result = await window.pywebview.api.choose_install_directory();
+      const result = await api.choose_install_directory();
       if (result.ok && !result.cancelled) {
         document.getElementById("installDirectory").value = result.path;
       } else if (!result.ok) {
@@ -1530,7 +1573,7 @@
       }
       if (!confirm("Move installed executables to this directory? Reconfigure clients afterwards so they use the new paths.")) return;
       setBusy(true);
-      const result = await window.pywebview.api.set_install_directory(path, true);
+      const result = await api.set_install_directory(path, true);
       if (result.ok) {
         toast(`Installation directory updated. Reconfigure clients if executables were moved.`, "success");
         await loadState();
@@ -1541,35 +1584,35 @@
     }
 
     async function createShortcuts(locations) {
-      const result = await window.pywebview.api.create_shortcuts(locations);
+      const result = await api.create_shortcuts(locations);
       if (result.ok) toast(`Created ${result.created.length} shortcut(s).`, "success");
       else toast(result.error || "Could not create shortcut.", "error");
     }
 
     async function openFolder() {
-      const result = await window.pywebview.api.open_install_folder();
+      const result = await api.open_install_folder();
       if (!result.ok) toast(result.error, "error");
     }
 
     async function openRelease() {
-      const result = await window.pywebview.api.open_release_page();
+      const result = await api.open_release_page();
       if (!result.ok) toast(result.error, "error");
     }
 
     async function runMoodleSetup() {
-      const result = await window.pywebview.api.run_moodle_setup();
+      const result = await api.run_moodle_setup();
       if (result.ok) toast("Moodle setup opened in a new terminal.", "success");
       else toast(result.error, "error");
     }
 
     async function runUntisSetup() {
-      const result = await window.pywebview.api.run_untis_setup();
+      const result = await api.run_untis_setup();
       if (result.ok) toast("WebUntis setup opened in a new terminal.", "success");
       else toast(result.error, "error");
     }
 
     async function runProxmoxSetup() {
-      const result = await window.pywebview.api.run_proxmox_setup();
+      const result = await api.run_proxmox_setup();
       if (result.ok) toast("Proxmox VE token setup opened in a new terminal.", "success");
       else toast(result.error, "error");
     }
@@ -1577,7 +1620,7 @@
     function bridgeAvailable() {
       return Boolean(
         window.pywebview?.api &&
-        typeof window.pywebview.api.bridge_status === "function"
+        typeof window.pywebview.api?.bridge_status === "function"
       );
     }
 
@@ -1596,7 +1639,7 @@
       if (bridgePollTimer) clearInterval(bridgePollTimer);
       if (bridgeTimeoutTimer) clearTimeout(bridgeTimeoutTimer);
       try {
-        const health = await window.pywebview.api.bridge_status();
+        const health = await api.bridge_status();
         if (!health?.ok) throw new Error("Python bridge health check failed.");
         await boot();
         bootState = "ready";
